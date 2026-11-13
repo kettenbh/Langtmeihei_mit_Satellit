@@ -1,4 +1,4 @@
-"""Satellitendaten je Feld: Sentinel-2 (NDVI, NDRE) und Sentinel-1 (VV/VH), Schnitterkennung.
+"""Satellitendaten je Feld: Sentinel-2 (NDVI, NDRE, LAI) und Sentinel-1 (VV/VH), Schnitterkennung.
 
 Zwei Wege:
   1. CDSE Sentinel Hub Statistical API (empfohlen): braucht einen kostenlosen OAuth-Client,
@@ -22,6 +22,7 @@ import pandas as pd
 import requests
 
 from .config import DATA_DIR, ROOT
+from .snap_lai import evalscript_s2, lai_numpy
 
 FIELDS_FILE = DATA_DIR / "felder.geojson"
 TOKEN_URL = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
@@ -30,24 +31,7 @@ S2_START = dt.date(2017, 3, 1)
 MIN_CLEAR = 0.8           # Mindestanteil wolkenfreier Feldpixel
 INNER_BUFFER_M = 10.0     # Randpixel (Wege, Hecken, Wald) ausschließen
 
-EVAL_S2 = """//VERSION=3
-function setup() {
-  return {
-    input: [{bands: ["B04", "B05", "B08", "B8A", "SCL", "dataMask"]}],
-    output: [
-      {id: "ndvi", bands: 1, sampleType: "FLOAT32"},
-      {id: "ndre", bands: 1, sampleType: "FLOAT32"},
-      {id: "dataMask", bands: 1}
-    ]
-  };
-}
-function evaluatePixel(s) {
-  // SCL 4 = Vegetation, 5 = unbewachsen; Wolken, Schatten, Schnee, Wasser fallen heraus
-  var ok = (s.SCL == 4 || s.SCL == 5) ? 1 : 0;
-  var ndvi = (s.B08 - s.B04) / (s.B08 + s.B04 + 1e-6);
-  var ndre = (s.B8A - s.B05) / (s.B8A + s.B05 + 1e-6);
-  return {ndvi: [ndvi], ndre: [ndre], dataMask: [s.dataMask * ok]};
-}"""
+EVAL_S2 = evalscript_s2()   # NDVI, NDRE, LAI (SNAP-Netz), siehe heu/snap_lai.py
 
 EVAL_S1 = """//VERSION=3
 function setup() {
@@ -202,6 +186,7 @@ def _parse_stats(js: dict, outputs: list[str]) -> pd.DataFrame:
             r[o] = pc.get("50.0", st_.get("mean"))
             r[f"{o}_q25"], r[f"{o}_q75"] = pc.get("25.0"), pc.get("75.0")
             r[f"{o}_mean"] = st_.get("mean")
+            r[f"{o}_std"] = st_.get("stDev")
         rows.append(r)
     df = pd.DataFrame(rows)
     if df.empty:
@@ -219,7 +204,7 @@ def fetch_cdse(field: dict, kind: str, start: dt.date, end: dt.date, client: CDS
         if kind == "s2":
             data = {"type": "sentinel-2-l2a", "dataFilter": {"maxCloudCoverage": 90}}
             js = client.statistics(_stats_body(geom, field["lat"], y0, y1, data, EVAL_S2, 10))
-            parts.append(_parse_stats(js, ["ndvi", "ndre"]))
+            parts.append(_parse_stats(js, ["ndvi", "ndre", "lai"]))
         else:
             data = {"type": "sentinel-1-grd",
                     "dataFilter": {"acquisitionMode": "IW", "polarization": "DV", "resolution": "HIGH",
@@ -271,7 +256,7 @@ def fetch_earth_search(field: dict, start: dt.date, end: dt.date, progress=None)
                 xs = [p[0] for p in g["coordinates"][0]]
                 ys = [p[1] for p in g["coordinates"][0]]
                 bounds = (min(xs), min(ys), max(xs), max(ys))
-            for key in ("red", "nir", "rededge1", "nir08", "scl"):
+            for key in ("green", "red", "rededge1", "rededge2", "rededge3", "nir", "nir08", "swir16", "swir22", "scl"):
                 a = it.assets[key]
                 with rasterio.open(a.href) as src:
                     win = from_bounds(*bounds, transform=src.transform).round_offsets().round_lengths()
@@ -289,8 +274,18 @@ def fetch_earth_search(field: dict, start: dt.date, end: dt.date, progress=None)
                 continue
             ndvi = (arrs["nir"] - arrs["red"]) / (arrs["nir"] + arrs["red"] + 1e-6)
             ndre = (arrs["nir08"] - arrs["rededge1"]) / (arrs["nir08"] + arrs["rededge1"] + 1e-6)
+            # LAI (SNAP-Netz). Winkel aus den STAC-Metadaten; fehlt der Beobachtungswinkel, gilt
+            # näherungsweise nadirnah (5°) und senkrechter relativer Azimut (Fallback, ungenauer als CDSE).
+            pr = it.properties
+            sun_zen = 90.0 - float(pr.get("view:sun_elevation", 45.0))
+            sun_az = float(pr.get("view:sun_azimuth", 160.0))
+            view_zen = float(pr.get("view:incidence_angle", pr.get("s2:mean_incidence_zenith_angle", 5.0)))
+            view_az = float(pr.get("view:azimuth", pr.get("s2:mean_incidence_azimuth_angle", sun_az - 90.0)))
+            lai = lai_numpy({"B03": arrs["green"], "B04": arrs["red"], "B05": arrs["rededge1"],
+                             "B06": arrs["rededge2"], "B07": arrs["rededge3"], "B8A": arrs["nir08"],
+                             "B11": arrs["swir16"], "B12": arrs["swir22"]}, view_zen, sun_zen, sun_az, view_az)
             r = {"date": pd.Timestamp(day), "clear": ok.sum() / n}
-            for name, v in (("ndvi", ndvi), ("ndre", ndre)):
+            for name, v in (("ndvi", ndvi), ("ndre", ndre), ("lai", lai)):
                 vv = v[ok]
                 r[name] = np.median(vv) if len(vv) else np.nan
                 r[f"{name}_q25"] = np.percentile(vv, 25) if len(vv) else np.nan
@@ -329,6 +324,8 @@ def update(field: dict, backend: str = "auto", progress=None) -> dict[str, pd.Da
     kinds = ("s2", "s1") if use_cdse else ("s2",)
     for kind in kinds:
         old = load_cached(field["id"], kind)
+        if kind == "s2" and old is not None and "lai" not in old.columns:
+            old = None   # Cache aus der Zeit vor dem LAI-Evalscript: einmal komplett neu laden
         start = S2_START if old is None or old.empty else (old.index.max().date() - dt.timedelta(days=10))
         if progress:
             progress(0.0, f"{field['name']}: {kind.upper()} ab {start}")
@@ -389,6 +386,7 @@ def detect_cuts(s2: pd.DataFrame, s1: pd.DataFrame | None = None, min_drop: floa
 
 def synthetic_s2(model_trace_by_year: dict[int, np.ndarray], seed: int = 3) -> pd.DataFrame:
     """Kunst-Satellitenreihe aus Modell-LAI (nur Testmodus): NDVI = 0.9 - 0.75·exp(-0.6·LAI) + Rauschen,
+    LAI = Modell-LAI + Rauschen (σ = max(0,5; 0,25·LAI)),
     Aufnahmen alle 5 Tage, 55 % bewölkt."""
     rng = np.random.default_rng(seed)
     rows = []
@@ -396,8 +394,10 @@ def synthetic_s2(model_trace_by_year: dict[int, np.ndarray], seed: int = 3) -> p
         for d in range(0, 365, 5):
             lai = tr[d, 7] if tr.shape[1] > 7 else 2.0
             ndvi = 0.9 - 0.75 * math.exp(-0.6 * lai) + rng.normal(0, 0.03)
+            lai_obs = max(0.0, lai + rng.normal(0, max(0.5, 0.25 * lai)))
             clear = 1.0 if rng.random() > 0.55 else rng.random() * 0.5
             day = dt.date(y, 1, 1) + dt.timedelta(days=d)
             rows.append({"date": pd.Timestamp(day), "clear": clear, "ndvi": ndvi,
-                         "ndvi_q25": ndvi - 0.03, "ndvi_q75": ndvi + 0.03, "ndre": ndvi * 0.6})
+                         "ndvi_q25": ndvi - 0.03, "ndvi_q75": ndvi + 0.03, "ndre": ndvi * 0.6,
+                         "lai": lai_obs, "lai_q25": lai_obs - 0.3, "lai_q75": lai_obs + 0.3})
     return pd.DataFrame(rows).set_index("date")

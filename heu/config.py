@@ -108,3 +108,27 @@ class ParasitenAnnahmen:
 
 HITZE = HitzeAnnahmen()
 PARASITEN = ParasitenAnnahmen()
+
+
+@dataclass(frozen=True)
+class DAKonfig:
+    """Datenassimilation (Plan docs/PLAN_hybridmodell_assimilation.md, Abschnitt 3.2). Startwerte, im Hindcast nachjustieren."""
+    mitglieder: int = 64
+    parameter: tuple = ("NI", "RUEmax")        # Parameter im erweiterten Zustand
+    param_sigma: tuple = (0.2, 0.1)            # Prior-Streuung (log) der Parameter
+    param_grenzen: tuple = ((0.2, 1.2), (1.5, 4.5))
+    param_daempfung: float = 0.4               # Anteil des Kalman-Updates, der bei Parametern ankommt
+    zustand_sigma: float = 0.3                 # Prior-Streuung (log) der Anfangsbiomassen
+    inflation: float = 1.05                    # multiplikative Aufweitung der Abweichungen vor jedem Update
+    gating_sigma: float = 3.0                  # Aufnahmen mit |Innovation| > gating·σ werden verworfen
+    wetter_sigma_strahlung: float = 0.10       # Tagesstörung Strahlung (log), Wetterpixel ≠ Feld
+    wetter_sigma_regen: float = 0.25           # Tagesstörung Niederschlag (log)
+    modell_sigma: float = 0.05                 # Modellfehler auf den Tageszuwachs (log), AR(1)
+    modell_ar: float = 0.9
+    operator_a: float = 1.0                    # LAI_S2 ≈ a · LAI_Modell + b (in Stufe A kalibrieren)
+    operator_b: float = 0.0
+    sperrtage_nach_schnitt: int = 3            # Aufnahmen so lange nach einem Schnitt nicht verwenden
+    min_clear: float = 0.8
+
+
+DA = DAKonfig()
