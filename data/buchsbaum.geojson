@@ -1,0 +1,21 @@
+{
+ "type": "FeatureCollection",
+ "features": [
+  {
+   "type": "Feature",
+   "properties": {
+    "id": "buchsbaum_hof",
+    "name": "Buchsbäume Hof",
+    "bestand": "alt, dicht",
+    "quelle": "Hubert 2026-11-06, UTM 33U 325349 5328853"
+   },
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     12.65459,
+     48.089
+    ]
+   }
+  }
+ ]
+}

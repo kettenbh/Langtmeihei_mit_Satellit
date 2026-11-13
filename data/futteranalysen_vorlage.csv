@@ -1,0 +1,3 @@
+# Eigene Futteranalysen (z. B. LKV-Futterlabor). Nach data/futteranalysen.csv kopieren und füllen.
+# datum = Schnittdatum (TT.MM.JJJJ), nel = MJ NEL/kg TM, xp = g Rohprotein/kg TM, rohfaser = g/kg TM
+datum,schnitt,weide,nel,xp,rohfaser

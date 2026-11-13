@@ -1,0 +1,4 @@
+# Vorlage: als data/heupreise.csv speichern und mit echten Werten füllen (eine Zeile je Monat und Segment).
+# monat = JJJJ-MM, preis_eur_dt = Euro je dt Heu (Frischmasse, ab Hof/frei Hof einheitlich halten),
+# segment = konventionell | bio, quelle = z. B. LfL Marktbericht, Wochenblatt-Notierung, eigener Abschluss
+monat,preis_eur_dt,segment,quelle

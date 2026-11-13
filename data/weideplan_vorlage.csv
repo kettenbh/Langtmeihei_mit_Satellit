@@ -1,0 +1,7 @@
+# Weideplan für das Parasitenmodell. Nach data/weideplan.csv kopieren und anpassen.
+# gruppe: z. B. "Jungrinder 1. Weidesaison", "Kühe", "Trockensteher" (das Wurmmodell nutzt Gruppen mit "jung")
+# weide: Name wie in data/felder.geojson; von/bis: TT.MM. (gilt für jedes Jahr); tiere: Anzahl
+gruppe,weide,von,bis,tiere
+Jungrinder 1. Weidesaison,Wiese Ost,01.05.,15.06.,12
+Jungrinder 1. Weidesaison,Wiese West,16.06.,31.07.,12
+Jungrinder 1. Weidesaison,Wiese Ost,01.08.,15.10.,12
