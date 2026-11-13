@@ -348,8 +348,11 @@ def detect_cuts(s2: pd.DataFrame, s1: pd.DataFrame | None = None, min_drop: floa
     """Schnitt = NDVI-Abfall um mindestens min_drop zwischen zwei klaren Aufnahmen
     (vorher ≥ min_before, Abstand ≤ max_gap_days). Geschätztes Datum: Mitte zwischen den Aufnahmen.
     Sentinel-1: Abfall der VH-Rückstreuung um ≥ 1 dB im selben Zeitraum gilt als Bestätigung."""
-    if s2 is None or s2.empty:
-        return pd.DataFrame(columns=["datum", "frueh", "spaet", "ndvi_vor", "ndvi_nach", "unsicherheit_tage", "s1_bestaetigt"])
+    cols = ["datum", "frueh", "spaet", "ndvi_vor", "ndvi_nach", "unsicherheit_tage", "s1_bestaetigt"]
+    leer = pd.DataFrame({c: pd.Series(dtype="datetime64[ns]" if c in ("datum", "frueh", "spaet") else "float")
+                         for c in cols})
+    if s2 is None or s2.empty or "ndvi" not in s2:
+        return leer
     c = s2[(s2["clear"] >= MIN_CLEAR) & s2["ndvi"].notna()]
     c = c[(c.index.month >= 4) & (c.index.month <= 10)]
     rows = []
@@ -372,7 +375,7 @@ def detect_cuts(s2: pd.DataFrame, s1: pd.DataFrame | None = None, min_drop: floa
                          "unsicherheit_tage": gap / 2, "s1_bestaetigt": conf})
     df = pd.DataFrame(rows)
     if df.empty:
-        return df
+        return leer     # keine Schnitte erkannt: leere Tabelle mit allen Spalten
     # Doppelte Treffer desselben Schnitts zusammenfassen
     keep = [0]
     for j in range(1, len(df)):
