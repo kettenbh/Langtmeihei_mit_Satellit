@@ -99,9 +99,26 @@ heu/dwd.py        DWD-Stationsdaten (CDC), ET0 nach FAO-56
 heu/stunden.py    Stündliches ERA5, Ensemble-Vorhersage, Rückblick-Demo
 heu/plots.py      Gemeinsame Diagramme (Band 1991–2025, Histogramm, Trend)
 heu/ui.py         Gecachte Datenlader für alle Seiten
+heu/ensemble.py   ModVege als Ensemble (NumPy, N Mitglieder mit eigenen Parametern/Wetter/Schnitttagen)
+heu/zwilling.py   Zwillingsexperiment: synthetische Wahrheit, S2-LAI-Beobachtungen, Kennzahlen (CRPS)
 pages/            Seiten Futterqualität, Tiergesundheit, Klimatrend
 scripts/selftest.py  Funktionstest ohne Internet
+scripts/benchmark_ensemble.py  Laufzeit Skalar- gegen Ensemble-Modell
+scripts/twin_experiment.py     Zwillingsexperiment (derzeit Open-Loop-Messlatte ohne Assimilation)
+tests/            Regressionstests (pip install -r requirements-dev.txt; python -m pytest -q tests/)
+docs/PLAN_hybridmodell_assimilation.md  Plan Hybridmodell mit Satelliten-Datenassimilation
 ```
+
+## Hybridmodell mit Satelliten-Assimilation (in Arbeit)
+
+Dieses Repo ist die Weiterentwicklung der Demo-App `heu-prognose-mvp` um die Datenassimilation
+(Plan: `docs/PLAN_hybridmodell_assimilation.md`).
+
+- **Paket 1 (fertig):** `heu/ensemble.py` rechnet ModVege für viele Mitglieder gleichzeitig. Die Ergebnisse
+  stimmen mit `heu/model.py` bis auf Rundungsfehler überein (`tests/test_ensemble.py`). 64 Mitglieder ×
+  35 Wetterjahre laufen etwa 20-mal schneller als mit der Skalarversion. Das Zwillingsexperiment liefert die
+  Open-Loop-Messlatte.
+- Als Nächstes: LAI-Beobachtungen aus Sentinel-2 (Paket 2) und der EnKF (Paket 3).
 
 ## Wichtige Grenzen
 
