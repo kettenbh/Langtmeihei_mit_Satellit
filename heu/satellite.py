@@ -178,6 +178,9 @@ def _parse_stats(js: dict, outputs: list[str]) -> pd.DataFrame:
         for o in outputs:
             st_ = item["outputs"][o]["bands"]["B0"]["stats"]
             n, nod = st_.get("sampleCount", 0), st_.get("noDataCount", 0)
+            # sampleCount zählt alle Pixel der Bounding Box, auch außerhalb des Feldes. Der rohe Anteil
+            # erreicht deshalb nie 1; normiere_clear() rechnet ihn auf die Feldpixel um.
+            r["valid_px"], r["sample_px"] = n - nod, n
             r["clear"] = (n - nod) / n if n else 0.0
             if n - nod <= 0:
                 r[o] = r[f"{o}_q25"] = r[f"{o}_q75"] = np.nan
@@ -301,6 +304,31 @@ def fetch_earth_search(field: dict, start: dt.date, end: dt.date, progress=None)
 # ---------------------------------------------------------------------------
 # Cache
 # ---------------------------------------------------------------------------
+def normiere_clear(df: pd.DataFrame, min_treffer: int = 3) -> pd.DataFrame:
+    """Klar-Anteil bezogen auf die Feldpixel statt auf die Bounding Box.
+
+    Die Statistical API zählt in sampleCount alle Pixel des umschließenden Rechtecks. Pixel außerhalb
+    des Feldes sind immer noData, deshalb lag der rohe Anteil bei Wiese Ost höchstens bei 0,70.
+    Bezug ist die größte Zahl gültiger Pixel der Reihe (= wolkenfreie Aufnahme). Normiert wird nur,
+    wenn mindestens `min_treffer` Aufnahmen diesen Wert (±2 %) erreichen. Ältere Caches ohne Pixelzahlen
+    werden über den größten Klar-Anteil normiert. Mehrfaches Anwenden ändert nichts.
+    """
+    if df is None or df.empty or "clear" not in df:
+        return df
+    df = df.copy()
+    if "valid_px" in df and df["valid_px"].notna().any():
+        v = df["valid_px"].astype(float)
+        ref = v.max()
+        if ref > 0 and (v >= 0.98 * ref).sum() >= min_treffer:
+            df["clear"] = np.where(v.notna(), (v / ref).clip(upper=1.0), df["clear"])
+        return df
+    c = df["clear"].astype(float)
+    ref = c.max()
+    if 0 < ref < 0.98 and (c >= 0.98 * ref).sum() >= min_treffer:
+        df["clear"] = (c / ref).clip(upper=1.0)
+    return df
+
+
 def cache_path(field_id: str, kind: str):
     return DATA_DIR / f"sat_{kind}_{field_id}.csv"
 
@@ -309,7 +337,8 @@ def load_cached(field_id: str, kind: str) -> pd.DataFrame | None:
     p = cache_path(field_id, kind)
     if not p.exists():
         return None
-    return pd.read_csv(p, parse_dates=["date"], index_col="date")
+    df = pd.read_csv(p, parse_dates=["date"], index_col="date")
+    return normiere_clear(df) if kind == "s2" else df
 
 
 def update(field: dict, backend: str = "auto", progress=None) -> dict[str, pd.DataFrame]:
@@ -333,6 +362,8 @@ def update(field: dict, backend: str = "auto", progress=None) -> dict[str, pd.Da
         df = new if old is None else pd.concat([old[old.index < pd.Timestamp(start)], new])
         if not df.empty:
             df = df[~df.index.duplicated(keep="last")].sort_index()
+            if kind == "s2" and use_cdse:
+                df = normiere_clear(df)
             df.to_csv(cache_path(field["id"], kind), index_label="date")
         out[kind] = df
     if "s1" not in out:
