@@ -23,7 +23,7 @@ def test_synthetic_lai_respects_clouds_and_noise():
     lai = np.full(365, 3.0)
     obs = Z.synthetische_lai(lai, np.random.default_rng(1), revisit=5, p_bewoelkt=0.5)
     n_ueberfluege = len(range(60, 300, 5))
-    assert 0.3 * n_ueberfluege < len(obs.tag) < 0.7 * n_ueberfluege
+    assert 0.3 * n_ueberfluege < len(obs) < 0.7 * n_ueberfluege
     assert np.all(obs.clear >= 0.8) and np.all(obs.sigma >= 0.75)
     assert abs(obs.lai.mean() - 3.0) < 3 * obs.sigma.mean() / np.sqrt(len(obs.tag))
 

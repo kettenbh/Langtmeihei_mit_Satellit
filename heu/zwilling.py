@@ -4,8 +4,8 @@ Idee: Ein "wahres" Feld wird mit bekannten, absichtlich anderen Parametern simul
 synthetische Sentinel-2-LAI-Beobachtungen mit Wolkenlücken und Messfehler. Ein Prior-Ensemble mit den
 Standardannahmen der App läuft dann gegen diese Wahrheit.
 
-Paket 1 liefert die Bausteine und den Open-Loop-Lauf (Ensemble ohne Korrektur) als Messlatte.
-Paket 3 setzt den EnKF-Schritt an den Beobachtungstagen dazwischen und muss besser abschneiden.
+Paket 1 lieferte die Bausteine und den Open-Loop-Lauf (Ensemble ohne Korrektur) als Messlatte.
+Paket 3 (heu/assimilation.py) setzt den EnKF-Schritt an den Beobachtungstagen dazwischen.
 """
 from __future__ import annotations
 
@@ -18,20 +18,7 @@ from .config import Annahmen
 from .model import ModVegeParams
 
 
-# ---------------------------------------------------------------------------
-# Beobachtungsfehler (Plan 3.2)
-# ---------------------------------------------------------------------------
-def lai_sigma(lai, clear, rel: float = 0.25, minimum: float = 0.5):
-    """Standardabweichung des S2-LAI: max(0,5; 0,25·LAI) × (1 + 2·(1 − Klar-Anteil))."""
-    return np.maximum(minimum, rel * np.asarray(lai)) * (1.0 + 2.0 * (1.0 - np.asarray(clear)))
-
-
-@dataclass
-class Beobachtungen:
-    tag: np.ndarray        # 0-basierter Tag im 365-Tage-Jahr
-    lai: np.ndarray        # beobachteter LAI
-    sigma: np.ndarray      # angenommener Beobachtungsfehler
-    clear: np.ndarray      # Anteil wolkenfreier Feldpixel
+from .beobachtung import Beobachtungen, lai_sigma  # noqa: E402  (Fehlermodell aus Plan 3.2)
 
 
 def synthetische_lai(lai_wahr: np.ndarray, rng: np.random.Generator, revisit: int = 5,
@@ -50,7 +37,7 @@ def synthetische_lai(lai_wahr: np.ndarray, rng: np.random.Generator, revisit: in
         werte.append(max(0.0, lai_wahr[d] + bias + rng.normal(0.0, s)))
         sig.append(s)
         clr.append(c)
-    return Beobachtungen(np.array(tage, dtype=int), np.array(werte), np.array(sig), np.array(clr))
+    return Beobachtungen(np.array(tage, dtype=int), np.array(werte), np.array(sig), np.array(clr), "lai")
 
 
 # ---------------------------------------------------------------------------
