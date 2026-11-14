@@ -1,4 +1,6 @@
-# Heu-Prognose MVP (Kirchweidach)
+# Langt mei Hei?
+
+Heu-Prognose für die Wiesen in Kirchweidach (Lkr. Altötting), hier mit Satelliten-Datenassimilation.
 
 Streamlit-App, die die Heusaison 2026 für ein generisches Feld (2 ha, Kirchweidach, Lkr. Altötting) **im Rückblick simuliert**:
 Für jeden Stichtag zwischen 1. März und dem letzten Datentag rechnet sie, was eine Prognose an diesem Tag gewusst hätte.
@@ -9,7 +11,7 @@ Das Wetter bis zum Stichtag ist bekannt, danach kommen 35 Szenarien aus den Trai
 Voraussetzung ist Python 3.10 oder neuer (`python3 --version`; sonst `brew install python`).
 
 ```bash
-cd heu-prognose-mvp
+cd Langtmeihei_mit_Satellit
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -83,7 +85,6 @@ Bei langen Wolkenlücken werden Schnitte verpasst.
 ## Aufbau
 
 ```
-app.py            Streamlit-Oberfläche
 heu/config.py     Alle generischen Annahmen (Standort, Ertragsniveau, Schnittregel, Verluste)
 heu/weather.py    Wetterabruf (Open-Meteo), Cache, 365-Tage-Jahre
 heu/model.py      ModVege-Graswachstum, Bodenwasser, Schnittregel, Heuwetter, OMD→NEL
@@ -104,7 +105,8 @@ heu/zwilling.py   Zwillingsexperiment: synthetische Wahrheit, S2-LAI-Beobachtung
 heu/snap_lai.py   LAI aus Sentinel-2 (SNAP-Biophysik-Netz), Evalscript für CDSE und NumPy-Version
 heu/beobachtung.py  Beobachtungsformat, Fehlermodell, Qualitätskontrolle, Beobachtungsoperatoren
 heu/assimilation.py Ensemble-Kalman-Filter mit erweitertem Zustand, Saison-Analyse, Prognose ab Analyse
-pages/            Seiten Futterqualität, Tiergesundheit, Klimatrend
+app.py            Einstieg mit Navigation (Langt mei Hei?, Futterqualität, Tiergesundheit, Klimatrend)
+app_pages/        Hauptseite 0_Langt_mei_Hei.py und Seiten Futterqualität, Tiergesundheit, Klimatrend
 scripts/selftest.py  Funktionstest ohne Internet
 scripts/benchmark_ensemble.py  Laufzeit Skalar- gegen Ensemble-Modell
 scripts/twin_experiment.py     Zwillingsexperiment EnKF gegen Open Loop
