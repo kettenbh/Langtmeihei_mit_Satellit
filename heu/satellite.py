@@ -374,48 +374,145 @@ def update(field: dict, backend: str = "auto", progress=None) -> dict[str, pd.Da
 # ---------------------------------------------------------------------------
 # Schnitterkennung
 # ---------------------------------------------------------------------------
-def detect_cuts(s2: pd.DataFrame, s1: pd.DataFrame | None = None, min_drop: float = 0.15,
-                min_before: float = 0.6, max_gap_days: int = 25, min_sep_days: int = 25) -> pd.DataFrame:
-    """Schnitt = NDVI-Abfall um mindestens min_drop zwischen zwei klaren Aufnahmen
-    (vorher ≥ min_before, Abstand ≤ max_gap_days). Geschätztes Datum: Mitte zwischen den Aufnahmen.
-    Sentinel-1: Abfall der VH-Rückstreuung um ≥ 1 dB im selben Zeitraum gilt als Bestätigung."""
-    cols = ["datum", "frueh", "spaet", "ndvi_vor", "ndvi_nach", "unsicherheit_tage", "s1_bestaetigt"]
-    leer = pd.DataFrame({c: pd.Series(dtype="datetime64[ns]" if c in ("datum", "frueh", "spaet") else "float")
-                         for c in cols})
+NUTZUNG_GRUENLAND = "Grünland"
+NUTZUNG_ACKER = "Acker/Umbruch"
+
+
+def nutzung_je_jahr(s2: pd.DataFrame, max_ndvi_offen: float = 0.3, min_offen: int = 2) -> dict[int, str]:
+    """Nutzung je Jahr aus der NDVI-Reihe: Grünland ist von März bis Oktober nie großflächig offen.
+
+    Ein Jahr gilt als "Acker/Umbruch", wenn mindestens `min_offen` klare Aufnahmen von März bis Oktober
+    einen Feld-Median-NDVI unter `max_ndvi_offen` haben (offener Boden: Saatbett, Stoppel nach der
+    Getreideernte, Umbruch). Eine einzelne Aufnahme reicht nicht, weil Dunst, den die SCL-Maske nicht
+    erkennt, einzelne Tage auf NDVI 0,1 bis 0,2 drücken kann (z. B. 29.10.2024 auf allen drei Feldern).
+    Gemähtes Grünland bleibt dagegen über 0,45, auch in Trockenphasen.
+    """
+    if s2 is None or s2.empty or "ndvi" not in s2:
+        return {}
+    c = s2[(s2["clear"] >= MIN_CLEAR) & s2["ndvi"].notna()]
+    out = {}
+    for y in sorted(set(s2.index.year)):
+        d = c[(c.index.year == y) & (c.index.month >= 3) & (c.index.month <= 10)]
+        offen = int((d["ndvi"] < max_ndvi_offen).sum())
+        out[int(y)] = NUTZUNG_ACKER if offen >= min_offen else NUTZUNG_GRUENLAND
+    return out
+
+
+SCHNITT_SPALTEN = ["datum", "frueh", "spaet", "ndvi_vor", "ndvi_nach", "lai_vor", "lai_nach",
+                   "unsicherheit_tage", "s1_bestaetigt", "kriterium", "nutzung"]
+
+
+def detect_cuts(s2: pd.DataFrame, s1: pd.DataFrame | None = None, min_before: float = 0.6,
+                ndvi_drop: float = 0.12, ndvi_drop_stark: float = 0.2, lai_min_vor: float = 1.5,
+                lai_drop_rel: float = 0.35, lai_max_nach: float = 3.0, lai_ndvi_drop: float = 0.04,
+                fenster_tage: int = 40, max_gap_days: int = 40, min_sep_days: int = 25,
+                rebound_days: int = 12, min_ndvi_nach: float = 0.25, nur_gruenland: bool = True) -> pd.DataFrame:
+    """Schnitte als Einbruch von einem Hoch auf ein Tief (klare Aufnahmen April bis Oktober).
+
+    Kandidat ist jedes Tief: eine Aufnahme, nach der der NDVI wieder steigt, die nächste Aufnahme mehr
+    als 15 Tage später kommt oder die letzte des Jahres.
+    Das Hoch ist die Aufnahme mit dem größten LAI (ohne LAI: NDVI) in den fenster_tage davor. So wird
+    auch ein Schnitt erkannt, der sich über mehrere Aufnahmen verteilt (Mähen, Heu liegt einige Tage,
+    Abfahren), was paarweise Vergleiche bei dichter Aufnahmefolge übersehen. Ein Schnitt liegt vor, wenn
+    der NDVI am Hoch ≥ min_before war und
+      (a) der LAI um mindestens lai_drop_rel (relativ) fällt, am Hoch ≥ lai_min_vor, am Tief ≤ lai_max_nach,
+          und der NDVI gleichzeitig um mindestens lai_ndvi_drop sinkt ("LAI"), oder
+      (b) der NDVI um mindestens ndvi_drop_stark fällt ("NDVI stark"), oder
+      (c) der NDVI um mindestens ndvi_drop fällt und der LAI dabei sinkt ("NDVI").
+    Der LAI reagiert auf einen Schnitt deutlich stärker als der NDVI, der bei Grünland wegen der grünen
+    Stoppel oft nur um 0,05 bis 0,15 fällt. Die NDVI-Bedingung in (a) fängt einzelne LAI-Ausreißer ab.
+
+    Artefakte (Dunst, Schatten, den die SCL-Maske nicht erkennt):
+      - Tief unter min_ndvi_nach: gemähtes Grünland bleibt grün, so tiefe Werte sind Umbruch oder Dunst;
+      - die nächste klare Aufnahme innerhalb rebound_days erreicht wieder NDVI und 90 % des LAI vom Hoch.
+
+    Zeitfenster: "frueh" ist die letzte Aufnahme, die noch nahe am Hoch liegt, "spaet" die erste, die
+    schon nahe am Tief liegt (je 25 % der NDVI-Spanne). Datum = Mitte, Unsicherheit = halber Abstand;
+    liegen mehr als max_gap_days dazwischen, wird der Kandidat verworfen. Treffer mit weniger als
+    min_sep_days Abstand werden zusammengefasst (stärkerer Einbruch gewinnt).
+    Sentinel-1: Abfall der VH-Rückstreuung um ≥ 1 dB im selben Zeitraum gilt als Bestätigung.
+    In Jahren, die nutzung_je_jahr als Acker/Umbruch einstuft, ist ein NDVI-Abfall meist Ernte,
+    Abreife oder Umbruch; diese Jahre werden mit nur_gruenland=True übersprungen.
+    """
+    leer = pd.DataFrame({c: pd.Series(dtype="datetime64[ns]" if c in ("datum", "frueh", "spaet") else
+                                      ("object" if c in ("kriterium", "nutzung", "s1_bestaetigt") else "float"))
+                         for c in SCHNITT_SPALTEN})
     if s2 is None or s2.empty or "ndvi" not in s2:
         return leer
+    nutzung = nutzung_je_jahr(s2)
     c = s2[(s2["clear"] >= MIN_CLEAR) & s2["ndvi"].notna()]
     c = c[(c.index.month >= 4) & (c.index.month <= 10)]
     rows = []
-    dates, vals = list(c.index), list(c["ndvi"])
-    for i in range(1, len(dates)):
-        gap = (dates[i] - dates[i - 1]).days
-        drop = vals[i - 1] - vals[i]
-        if gap <= max_gap_days and drop >= min_drop and vals[i - 1] >= min_before:
-            mid = dates[i - 1] + (dates[i] - dates[i - 1]) / 2
+    for jahr in sorted(set(c.index.year)):
+        nu = nutzung.get(int(jahr), NUTZUNG_GRUENLAND)
+        if nur_gruenland and nu != NUTZUNG_GRUENLAND:
+            continue
+        cj = c[c.index.year == jahr]
+        dates = list(cj.index)
+        nd = cj["ndvi"].to_numpy(dtype=float)
+        la = cj["lai"].to_numpy(dtype=float) if "lai" in cj else np.full(len(cj), np.nan)
+        for i in range(1, len(dates)):
+            if i + 1 < len(dates) and nd[i + 1] < nd[i] and (dates[i + 1] - dates[i]).days <= 15:
+                continue                                    # kein Tief: es geht gleich weiter abwärts
+            fen = [j for j in range(i) if (dates[i] - dates[j]).days <= fenster_tage]
+            if not fen:
+                continue
+            lai_ok = np.isfinite(la[i]) and all(np.isfinite(la[j]) for j in fen)
+            h = max(fen, key=lambda j: la[j]) if lai_ok else max(fen, key=lambda j: nd[j])
+            d_ndvi = max(nd[j] for j in fen if j >= h) - nd[i]
+            nd_hoch = nd[h]
+            if nd_hoch < min_before or d_ndvi <= 0:
+                continue
+            rel = (la[h] - la[i]) / la[h] if lai_ok and la[h] > 0 else np.nan
+            krit = None
+            if lai_ok and la[h] >= lai_min_vor and rel >= lai_drop_rel and la[i] <= lai_max_nach \
+                    and d_ndvi >= lai_ndvi_drop:
+                krit = "LAI"
+            elif d_ndvi >= ndvi_drop_stark:
+                krit = "NDVI stark"
+            elif d_ndvi >= ndvi_drop and (not lai_ok or rel > 0):
+                krit = "NDVI"
+            if krit is None or nd[i] < min_ndvi_nach:
+                continue
+            if i + 1 < len(dates) and (dates[i + 1] - dates[i]).days <= rebound_days:
+                nd_back = nd[i + 1] >= nd_hoch - 0.03
+                la_back = (not lai_ok) or (np.isfinite(la[i + 1]) and la[i + 1] >= 0.9 * la[h])
+                if nd_back and la_back:
+                    continue
+            # Zeitfenster eingrenzen
+            hi_ref = max(nd[j] for j in range(h, i))
+            span = hi_ref - nd[i]
+            f = max(j for j in range(h, i) if nd[j] >= hi_ref - 0.25 * span)
+            s_ = min(j for j in range(f + 1, i + 1) if nd[j] <= nd[i] + 0.25 * span)
+            a, b = dates[f], dates[s_]
+            gap = (b - a).days
+            if gap > max_gap_days:
+                continue
+            mid = a + (b - a) / 2
             conf = None
             if s1 is not None and not s1.empty and "vh_db" in s1:
-                w = s1.loc[dates[i - 1] - pd.Timedelta(days=12): dates[i] + pd.Timedelta(days=12), "vh_db"].dropna()
-                if len(w) >= 2:
-                    before = w[w.index <= mid]
-                    after = w[w.index > mid]
-                    if len(before) and len(after):
-                        conf = bool(before.iloc[-1] - after.iloc[0] >= 1.0)
-            rows.append({"datum": mid.normalize(), "frueh": dates[i - 1], "spaet": dates[i],
-                         "ndvi_vor": round(vals[i - 1], 3), "ndvi_nach": round(vals[i], 3),
-                         "unsicherheit_tage": gap / 2, "s1_bestaetigt": conf})
+                w = s1.loc[a - pd.Timedelta(days=12): b + pd.Timedelta(days=12), "vh_db"].dropna()
+                before, after = w[w.index <= mid], w[w.index > mid]
+                if len(before) and len(after):
+                    conf = bool(before.iloc[-1] - after.iloc[0] >= 1.0)
+            rows.append({"datum": mid.normalize(), "frueh": a, "spaet": b,
+                         "ndvi_vor": round(float(hi_ref), 3), "ndvi_nach": round(float(nd[i]), 3),
+                         "lai_vor": round(float(la[h]), 2) if lai_ok else np.nan,
+                         "lai_nach": round(float(la[i]), 2) if lai_ok else np.nan,
+                         "unsicherheit_tage": gap / 2, "s1_bestaetigt": conf, "kriterium": krit, "nutzung": nu,
+                         "_staerke": rel if np.isfinite(rel) else d_ndvi})
     df = pd.DataFrame(rows)
     if df.empty:
         return leer     # keine Schnitte erkannt: leere Tabelle mit allen Spalten
-    # Doppelte Treffer desselben Schnitts zusammenfassen
+    df = df.sort_values("datum").reset_index(drop=True)
     keep = [0]
     for j in range(1, len(df)):
         if (df.loc[j, "datum"] - df.loc[keep[-1], "datum"]).days < min_sep_days:
-            if df.loc[j, "ndvi_vor"] - df.loc[j, "ndvi_nach"] > df.loc[keep[-1], "ndvi_vor"] - df.loc[keep[-1], "ndvi_nach"]:
+            if df.loc[j, "_staerke"] > df.loc[keep[-1], "_staerke"]:
                 keep[-1] = j
         else:
             keep.append(j)
-    return df.loc[keep].reset_index(drop=True)
+    return df.loc[keep, SCHNITT_SPALTEN].reset_index(drop=True)
 
 
 def synthetic_s2(model_trace_by_year: dict[int, np.ndarray], seed: int = 3) -> pd.DataFrame:

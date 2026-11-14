@@ -375,8 +375,13 @@ with tabS:
                     "1 bis 3 Minuten je Feld, über Earth Search deutlich länger.")
         else:
             cuts = SAT.detect_cuts(s2, s1)
+            nutzung = SAT.nutzung_je_jahr(s2)
             jahre = sorted(set(s2.index.year), reverse=True)
             jahr = st.selectbox("Jahr", jahre, index=jahre.index(JAHR) if JAHR in jahre else 0)
+            if nutzung.get(jahr) == SAT.NUTZUNG_ACKER:
+                st.warning(f"{jahr} sieht nicht nach Dauergrünland aus: mehrere klare Aufnahmen zwischen März und "
+                           "Oktober zeigen offenen Boden (NDVI unter 0,3), also Ansaat, Getreidestoppel oder Umbruch. "
+                           "In solchen Jahren wird keine Schnitterkennung gemacht.")
             d = s2[s2.index.year == jahr]
             klar = d[d["clear"] >= SAT.MIN_CLEAR]
             trueb = d[(d["clear"] < SAT.MIN_CLEAR) & (d["clear"] > 0.2)]
@@ -402,8 +407,10 @@ with tabS:
             f7.update_yaxes(title_text="VH [dB]", secondary_y=True)
             f7.update_layout(height=420, margin=dict(t=30, b=10), legend=dict(orientation="h", y=1.15))
             st.plotly_chart(f7, width="stretch")
-            st.caption("Grün gestrichelt: aus dem Satelliten erkannte Schnitte (Band = Zeitraum zwischen den Aufnahmen). "
-                       "Grau gepunktet: Schnitte laut Modell-Schnittregel.")
+            st.caption("Grün gestrichelt: aus dem Satelliten erkannte Schnitte (Band = Zeitraum, in dem der Schnitt "
+                       "liegen muss). Grau gepunktet: Schnitte laut Modell-Schnittregel. Erkannt wird ein Einbruch von "
+                       "LAI und NDVI von einem Hoch auf ein Tief; einzelne dunkle Aufnahmen mit sofortiger Erholung "
+                       "gelten als Dunst und werden ignoriert.")
 
             # Vergleich über alle Jahre
             rows = []
@@ -415,16 +422,20 @@ with tabS:
                 for r in det:
                     if mod:
                         diffs.append(min(abs((r["datum"].date() - m).days) for m in mod))
-                rows.append({"Jahr": y, "klare Aufnahmen Apr–Okt": int((dy["clear"] >= SAT.MIN_CLEAR).sum()),
-                             "Schnitte erkannt": len(det),
-                             "Daten erkannt": ", ".join(f"{r['datum']:%d.%m.}" for r in det),
+                acker = nutzung.get(y) == SAT.NUTZUNG_ACKER
+                rows.append({"Jahr": y, "Nutzung": nutzung.get(y, ""),
+                             "klare Aufnahmen Apr–Okt": int((dy["clear"] >= SAT.MIN_CLEAR).sum()),
+                             "Schnitte erkannt": None if acker else len(det),
+                             "Daten erkannt": "–" if acker else ", ".join(
+                                 f"{r['datum']:%d.%m.} (±{r['unsicherheit_tage']:.0f})" for r in det),
                              "Schnitte Modell": len(mod),
                              "Daten Modell": ", ".join(f"{m:%d.%m.}" for m in mod),
                              "Ø Abweichung [Tage]": round(float(np.mean(diffs)), 1) if diffs else None})
             st.subheader("Erkannte Schnitte gegen Modell-Schnittregel")
             st.dataframe(pd.DataFrame(rows).sort_values("Jahr", ascending=False), hide_index=True, width="stretch")
-            st.caption("Diese Gegenüberstellung ist die Grundlage für Schritt 3: Schnittregel und Modellparameter "
-                       "werden an den erkannten Terminen und am NDVI/LAI-Verlauf kalibriert.")
+            st.caption("Die Modelltermine sind keine Wahrheit, sondern die Schnittregel der App. Zum Prüfen der "
+                       "Erkennung braucht es die echten Schnitttermine vom Betrieb. Jahre mit Nutzung "
+                       "\"Acker/Umbruch\" fließen nicht in die Kalibrierung ein.")
             st.download_button("Satelliten-Zeitreihe als CSV", s2.to_csv().encode("utf-8"),
                                file_name=f"sentinel2_{FELD['id']}.csv")
 
