@@ -69,6 +69,7 @@ class Annahmen:
 
 
 STANDORT = Standort()
+STANDARD_FELD = "niederham"     # Vorauswahl in der Seitenleiste (id aus data/felder.geojson)
 ANNAHMEN = Annahmen()
 
 

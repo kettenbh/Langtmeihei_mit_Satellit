@@ -15,11 +15,12 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 from heu import forecast as F
-from heu.config import ANNAHMEN, STANDORT, Annahmen
+from heu.config import ANNAHMEN, STANDARD_FELD, STANDORT, Annahmen
 from heu.model import ModVegeParams, State, omd_to_nel, run
 from heu.prices import PRICE_FILE, load_prices, price_forecast
 from heu.weather import date_from_doy, doy365, load_weather, year_arrays
 from heu import satellite as SAT
+from heu import kalibrierung as KAL
 import os
 
 st.set_page_config(page_title="Langt mei Hei?", page_icon="🌾", layout="wide")
@@ -75,7 +76,8 @@ if "token" not in st.session_state:
 st.sidebar.title("🌾 Langt mei Hei?")
 FELDER = SAT.load_fields()
 feld_namen = [f["name"] for f in FELDER] + ["Generisches Feld (2 ha)"]
-feld_wahl = st.sidebar.selectbox("Feld", feld_namen)
+_std = next((i for i, f in enumerate(FELDER) if f["id"] == STANDARD_FELD), 0)
+feld_wahl = st.sidebar.selectbox("Feld", feld_namen, index=_std)
 FELD = next((f for f in FELDER if f["name"] == feld_wahl), None)
 st.sidebar.caption(STANDORT.name + (f" · {FELD['flaeche_ha']:.2f} ha" if FELD else " · generisch"))
 
@@ -438,6 +440,42 @@ with tabS:
                        "\"Acker/Umbruch\" fließen nicht in die Kalibrierung ein.")
             st.download_button("Satelliten-Zeitreihe als CSV", s2.to_csv().encode("utf-8"),
                                file_name=f"sentinel2_{FELD['id']}.csv")
+
+            # Stufe A: Kalibrierung je Feld (ES-MDA über alle Grünlandjahre)
+            st.subheader("Feld kalibrieren (Stufe A)")
+            st.caption("Das Modell wird an alle Grünlandjahre dieses Feldes angepasst: Nährstoffindex NI, "
+                       "Strahlungsnutzung RUEmax, nutzbare Feldkapazität WHC, Blattlebensdauer LLS und der "
+                       "Umrechnungsfaktor Satelliten-LAI ↔ Modell-LAI. Die Schnitte laufen an den erkannten Terminen, "
+                       "jeder Termin wird innerhalb seines Fensters mitgeschätzt. Das Ergebnis dient als Startwissen "
+                       "für die Assimilation im neuen Jahr.")
+            kp = KAL.pfad(FELD["id"])
+            if st.button(f"{FELD['name']} kalibrieren" + (" (neu)" if kp.exists() else ""), disabled=synthetic):
+                bar = st.progress(0.0, "Kalibriere …")
+                try:
+                    erg, kd = KAL.kalibrieren_feld(FELD["id"], s2, s1, M["df"], A,
+                                                   protokoll=lambda i, k: bar.progress(i / k, f"Iteration {i}/{k}"))
+                    st.session_state[f"kal_{FELD['id']}"] = erg
+                except ValueError as e:
+                    st.error(str(e))
+            erg = st.session_state.get(f"kal_{FELD['id']}")
+            if erg is not None:
+                k1, k2, k3 = st.columns(3)
+                k1.metric("Jahre", len(erg.jahre))
+                k2.metric("LAI-Fehler vorher → nachher", f"{erg.lai_rmse['prior']:.2f} → {erg.lai_rmse['posterior']:.2f}")
+                k3.metric("Ø Ertrag Modell [dt TM/ha]", f"{np.median(erg.ertrag['posterior'].mean(axis=1)) / 100:.0f}")
+                st.dataframe(erg.zusammenfassung(), hide_index=True, width="stretch",
+                             column_config={"Streuung behalten [%]": st.column_config.NumberColumn(format="%.0f"),
+                                            "Sensitivität": st.column_config.NumberColumn(format="%.2f")})
+                rows = []
+                for j, y in enumerate(erg.jahre):
+                    e = erg.ertrag["posterior"][:, j] / 100
+                    rows.append({"Jahr": y, "Ertrag brutto [dt TM/ha]": f"{np.median(e):.0f} ({np.percentile(e, 10):.0f}–{np.percentile(e, 90):.0f})",
+                                 "Schnitttermine geschätzt": ", ".join(f"{d2date(m):%d.%m.}" for m, _, _ in erg.schnitte.get(y, []))})
+                st.dataframe(pd.DataFrame(rows).sort_values("Jahr", ascending=False), hide_index=True, width="stretch")
+                st.caption("Das Ertragsniveau ist aus dem LAI allein kaum bestimmt und hängt an der Annahme in der "
+                           "Seitenleiste (Ziel-Jahresertrag). Mit echten Ertragsdaten (Ballenzahlen je Schnitt) wird es belastbar.")
+            elif kp.exists():
+                st.info(f"Kalibrierung vorhanden ({kp.name}). Zum Anzeigen oder Aktualisieren neu kalibrieren (ca. 10 s).")
 
 # ---------------------------------------------------------------------------
 # Tab 3: Wetter

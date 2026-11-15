@@ -6,3 +6,4 @@ data/sat_*.csv
 data/wetter_stunde_cache.csv.gz
 data/dwd_*
 data/dgm/
+data/kalibrierung_*.csv
