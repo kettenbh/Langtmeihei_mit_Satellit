@@ -6,6 +6,7 @@ Offline-Test mit Kunstwetter:  HEU_SYNTHETIC=1 streamlit run app.py
 from __future__ import annotations
 
 import datetime as dt
+import math
 from dataclasses import replace
 
 import numpy as np
@@ -415,6 +416,51 @@ with tabS:
                        "liegen muss). Grau gepunktet: Schnitte laut Modell-Schnittregel. Erkannt wird ein Einbruch von "
                        "LAI und NDVI von einem Hoch auf ein Tief; einzelne dunkle Aufnahmen mit sofortiger Erholung "
                        "gelten als Dunst und werden ignoriert.")
+
+            # Satellitenbild zum Stichtag (spontan über CDSE, ohne Cache)
+            st.subheader(f"Satellitenbild zum Stichtag {stichtag_date:%d.%m.%Y}")
+            d_klar = SAT.bild_datum(s2, stichtag_date)
+            b1, b2, b3 = st.columns([2, 2, 1])
+            art = b1.radio("Darstellung", ["Echtfarben", "NDVI (grün = dichter Bestand)"], horizontal=True)
+            quelle_bild = b2.radio("Aufnahme", (["letzte klare laut Cache"] if d_klar else []) +
+                                   ["wolkenärmste der letzten 20 Tage"], horizontal=True,
+                                   help="Der Cache kennt den Wolkenanteil über dem Feld. Ohne Treffer dort nimmt "
+                                        "CDSE die Aufnahme mit dem geringsten Wolkenanteil der Kachel.")
+            if not creds:
+                st.info("Für Satellitenbilder braucht es den CDSE-Zugang in .streamlit/secrets.toml.")
+            elif b3.button("Bild laden"):
+                try:
+                    if quelle_bild.startswith("letzte klare"):
+                        png, bb = SAT.satellitenbild(FELD, d_klar, "ndvi" if art.startswith("NDVI") else "truecolor")
+                        titel = f"Sentinel-2 vom {d_klar:%d.%m.%Y} (letzte klare Aufnahme vor dem Stichtag)"
+                    else:
+                        png, bb = SAT.satellitenbild(FELD, stichtag_date, "ndvi" if art.startswith("NDVI") else "truecolor",
+                                                     fenster_tage=20)
+                        titel = f"Sentinel-2, wolkenärmste Aufnahme {stichtag_date - dt.timedelta(days=20):%d.%m.}–{stichtag_date:%d.%m.%Y}"
+                    st.session_state["sat_bild"] = (FELD["id"], png, bb, titel)
+                except Exception as e:
+                    st.error(f"Bildabruf fehlgeschlagen: {e}")
+            sb = st.session_state.get("sat_bild")
+            if sb and sb[0] == FELD["id"]:
+                import io
+                from PIL import Image
+                _, png, bb, titel = sb
+                img = Image.open(io.BytesIO(png))
+                ring = FELD["geometry"]["coordinates"][0]
+                fi = go.Figure()
+                fi.add_layout_image(source=img, xref="x", yref="y", x=bb[0], y=bb[3], sizex=bb[2] - bb[0],
+                                    sizey=bb[3] - bb[1], sizing="stretch", layer="below")
+                fi.add_scatter(x=[c[0] for c in ring], y=[c[1] for c in ring], mode="lines",
+                               line=dict(color="#ffd400", width=3), name=FELD["name"])
+                lat_m = 0.5 * (bb[1] + bb[3])
+                fi.update_xaxes(range=[bb[0], bb[2]], visible=False)
+                fi.update_yaxes(range=[bb[1], bb[3]], visible=False, scaleanchor="x",
+                                scaleratio=1 / math.cos(math.radians(lat_m)))
+                fi.update_layout(height=520, margin=dict(t=30, b=0, l=0, r=0), title=titel, showlegend=False,
+                                 plot_bgcolor="white")
+                st.plotly_chart(fi, width="stretch")
+                st.caption("Gelb: Feldgrenze. 10 m je Pixel. Echtfarben zeigen auch Wolken und Schatten; im NDVI-Bild "
+                           "sind Wolken und Schatten laut Szenenklassifikation grau.")
 
             # Vergleich über alle Jahre
             rows = []

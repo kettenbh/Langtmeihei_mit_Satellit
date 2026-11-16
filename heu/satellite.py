@@ -27,6 +27,7 @@ from .snap_lai import evalscript_s2, lai_numpy
 FIELDS_FILE = DATA_DIR / "felder.geojson"
 TOKEN_URL = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
 STATS_URL = "https://sh.dataspace.copernicus.eu/api/v1/statistics"
+PROCESS_URL = "https://sh.dataspace.copernicus.eu/api/v1/process"
 S2_START = dt.date(2017, 3, 1)
 MIN_CLEAR = 0.8           # Mindestanteil wolkenfreier Feldpixel
 INNER_BUFFER_M = 10.0     # Randpixel (Wege, Hecken, Wald) ausschließen
@@ -144,6 +145,86 @@ class CDSE:
                 raise RuntimeError(f"CDSE {r.status_code}: {r.text[:400]}")
             return r.json()
         raise RuntimeError("CDSE: zu viele Anfragen, bitte später erneut versuchen")
+
+
+    def process(self, body: dict) -> bytes:
+        """Process API: liefert ein Bild (PNG-Bytes)."""
+        for attempt in range(4):
+            r = requests.post(PROCESS_URL, json=body, timeout=120,
+                              headers={"Authorization": f"Bearer {self.token()}", "Accept": "image/png"})
+            if r.status_code == 429:
+                time.sleep(5 * (attempt + 1))
+                continue
+            if r.status_code >= 400:
+                raise RuntimeError(f"CDSE {r.status_code}: {r.text[:400]}")
+            return r.content
+        raise RuntimeError("CDSE: zu viele Anfragen, bitte später erneut versuchen")
+
+
+EVAL_TRUECOLOR = """//VERSION=3
+function setup() { return {input: ["B02", "B03", "B04", "dataMask"], output: {bands: 4}}; }
+function evaluatePixel(s) { var g = 2.8; return [g * s.B04, g * s.B03, g * s.B02, s.dataMask]; }"""
+
+EVAL_NDVI = """//VERSION=3
+function setup() { return {input: ["B04", "B08", "SCL", "dataMask"], output: {bands: 4}}; }
+function evaluatePixel(s) {
+  if ([3, 8, 9, 10].indexOf(s.SCL) >= 0) { return [0.85, 0.85, 0.85, s.dataMask]; }   // Wolke/Schatten grau
+  var v = (s.B08 - s.B04) / (s.B08 + s.B04 + 1e-6);
+  var stops = [[0.0, [0.65, 0.45, 0.25]], [0.3, [0.85, 0.75, 0.4]], [0.5, [0.75, 0.85, 0.35]],
+               [0.7, [0.35, 0.7, 0.25]], [0.9, [0.05, 0.4, 0.1]]];
+  var c = stops[0][1];
+  for (var i = 1; i < stops.length; i++) {
+    if (v >= stops[i][0]) { c = stops[i][1]; continue; }
+    var a = stops[i - 1], b = stops[i], t = (v - a[0]) / (b[0] - a[0]);
+    c = [a[1][0] + t * (b[1][0] - a[1][0]), a[1][1] + t * (b[1][1] - a[1][1]), a[1][2] + t * (b[1][2] - a[1][2])];
+    break;
+  }
+  return [c[0], c[1], c[2], s.dataMask];
+}"""
+
+
+def bild_datum(s2: pd.DataFrame | None, stichtag: dt.date, max_tage: int = 30) -> dt.date | None:
+    """Letzte klare Aufnahme (Cache) am oder vor dem Stichtag, höchstens max_tage zurück."""
+    if s2 is None or s2.empty:
+        return None
+    c = s2[(s2["clear"] >= MIN_CLEAR) & (s2.index <= pd.Timestamp(stichtag))
+           & (s2.index >= pd.Timestamp(stichtag - dt.timedelta(days=max_tage)))]
+    return c.index.max().date() if len(c) else None
+
+
+def feld_bbox(field: dict, rand_m: float = 120.0) -> tuple[float, float, float, float]:
+    ring = field["geometry"]["coordinates"][0]
+    lon = [c[0] for c in ring]
+    lat = [c[1] for c in ring]
+    rx, ry = _res_deg(float(np.mean(lat)), rand_m)
+    return min(lon) - rx, min(lat) - ry, max(lon) + rx, max(lat) + ry
+
+
+def satellitenbild(field: dict, datum: dt.date, art: str = "truecolor", fenster_tage: int = 0,
+                   creds: tuple[str, str] | None = None, aufloesung_m: float = 10.0) -> tuple[bytes, tuple]:
+    """Sentinel-2-Bild (PNG) um das Feld, spontan über die CDSE Process API (ohne Cache).
+    fenster_tage = 0: genau dieser Tag; sonst die wolkenärmste Aufnahme in [datum − fenster, datum].
+    Gibt (PNG-Bytes, bbox lon/lat) zurück."""
+    creds = creds or cdse_credentials()
+    if not creds:
+        raise RuntimeError("Kein CDSE-Zugang hinterlegt (.streamlit/secrets.toml, Abschnitt [cdse]).")
+    bbox = feld_bbox(field)
+    lat = 0.5 * (bbox[1] + bbox[3])
+    rx, ry = _res_deg(lat, aufloesung_m)
+    w = max(16, int(round((bbox[2] - bbox[0]) / rx)))
+    h = max(16, int(round((bbox[3] - bbox[1]) / ry)))
+    von = datum - dt.timedelta(days=fenster_tage)
+    body = {
+        "input": {
+            "bounds": {"bbox": list(bbox), "properties": {"crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"}},
+            "data": [{"type": "sentinel-2-l2a",
+                      "dataFilter": {"timeRange": {"from": f"{von}T00:00:00Z", "to": f"{datum}T23:59:59Z"},
+                                     "mosaickingOrder": "leastCC"}}],
+        },
+        "output": {"width": w, "height": h, "responses": [{"identifier": "default", "format": {"type": "image/png"}}]},
+        "evalscript": EVAL_NDVI if art == "ndvi" else EVAL_TRUECOLOR,
+    }
+    return CDSE(*creds).process(body), bbox
 
 
 def _res_deg(lat: float, meters: float) -> tuple[float, float]:
