@@ -29,19 +29,7 @@ from heu.weather import synthetic_weather, year_arrays  # noqa: E402
 TOL = 10
 
 
-def s2_reihe(lai: np.ndarray, jahr: int, rng: np.random.Generator, dunst: float = 0.05) -> pd.DataFrame:
-    rows = []
-    for d in range(rng.integers(0, 5), 365, 5):
-        if rng.random() < 0.55:
-            continue
-        nd = 0.91 - 0.70 * np.exp(-0.96 * lai[d]) + rng.normal(0, 0.035)
-        lo = max(0.0, lai[d] * (1 + rng.normal(0, 0.25)))
-        if rng.random() < dunst:
-            nd -= rng.uniform(0.15, 0.45)
-            lo *= rng.uniform(0.5, 0.9)
-        rows.append({"date": pd.Timestamp(dt.date(jahr, 1, 1) + dt.timedelta(days=d)), "clear": 1.0,
-                     "ndvi": nd, "lai": lo})
-    return pd.DataFrame(rows).set_index("date")
+s2_reihe = Z.synthetische_s2_reihe
 
 
 def bewerte(detect, faelle):

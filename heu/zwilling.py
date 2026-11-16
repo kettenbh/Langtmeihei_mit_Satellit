@@ -118,3 +118,25 @@ def open_loop(w: dict, wahr: Wahrheit, p_prior: ModVegeParams, a: Annahmen, n: i
 
 def wahre_parameter(p: ModVegeParams, **abweichung) -> ModVegeParams:
     return replace(p, **abweichung)
+
+
+def synthetische_s2_reihe(lai: np.ndarray, jahr: int, rng: np.random.Generator, dunst: float = 0.05,
+                          p_bewoelkt: float = 0.55, lai_rel: float = 0.25):
+    """S2-Cache-ähnliche Tabelle (wie satellite.load_cached) aus einer wahren LAI-Reihe: Überflug alle
+    5 Tage, p_bewoelkt unbrauchbar, NDVI = 0,91 − 0,70·exp(−0,96·LAI) + N(0; 0,035) (angepasst an 406 klare
+    Aufnahmen von Wiese Ost/West), LAI mit relativem Fehler lai_rel, Anteil `dunst` der klaren Aufnahmen
+    als unerkannter Dunst (NDVI −0,15…−0,45, LAI ×0,5…0,9)."""
+    import datetime as dt
+    import pandas as pd
+    rows = []
+    for d in range(int(rng.integers(0, 5)), 365, 5):
+        if rng.random() < p_bewoelkt:
+            continue
+        nd = 0.91 - 0.70 * np.exp(-0.96 * lai[d]) + rng.normal(0, 0.035)
+        lo = max(0.0, lai[d] * (1 + rng.normal(0, lai_rel)))
+        if rng.random() < dunst:
+            nd -= rng.uniform(0.15, 0.45)
+            lo *= rng.uniform(0.5, 0.9)
+        rows.append({"date": pd.Timestamp(dt.date(jahr, 1, 1) + dt.timedelta(days=d)), "clear": 1.0,
+                     "ndvi": nd, "lai": lo})
+    return pd.DataFrame(rows).set_index("date")

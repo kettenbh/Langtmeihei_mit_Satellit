@@ -138,7 +138,9 @@ def prior(p: ModVegeParams, a: Annahmen, rng: np.random.Generator, cfg: DAKonfig
           n: int | None = None, posterior: E.EnsembleParams | None = None):
     """Prior-Ensemble. Mit `posterior` (Stufe A) werden die Parameter daraus gezogen, sonst um p gestreut."""
     n = n or cfg.mitglieder
-    if posterior is not None:
+    if posterior is not None and posterior.n == n:
+        ep = posterior.take(np.arange(n))     # Reihenfolge behalten: Mitglied i hat in jedem Jahr dieselben Parameter
+    elif posterior is not None:
         ep = posterior.take(rng.integers(0, posterior.n, n))
     else:
         ep = E.perturb_params(p, n, rng, dict(zip(cfg.parameter, cfg.param_sigma)))
@@ -149,10 +151,12 @@ def prior(p: ModVegeParams, a: Annahmen, rng: np.random.Generator, cfg: DAKonfig
 def analyse_saison(w: dict, p: ModVegeParams, a: Annahmen, obs: Beobachtungen | None,
                    schnitte: list[int] | np.ndarray | None, ende: int = 365, cfg: DAKonfig = DA,
                    seed: int = 0, schnitt_unsicherheit: int = 0, assimilieren: bool = True,
-                   posterior: E.EnsembleParams | None = None, n: int | None = None) -> Analyse:
+                   posterior: E.EnsembleParams | None = None, n: int | None = None,
+                   schnitt_fenster: list | None = None) -> Analyse:
     """Analysephase vom 1. Januar bis Tag `ende` (exklusiv) mit beobachteten Schnitten und S2-LAI.
 
     schnitte: beobachtete Schnitttage (gemeinsam), jedes Mitglied verschiebt um ±schnitt_unsicherheit.
+    schnitt_fenster: alternativ Liste (frueh, spaet) je Schnitt; jedes Mitglied zieht seinen Tag daraus.
     assimilieren=False liefert denselben Lauf ohne Korrektur (Open Loop, gleiche Zufallszahlen).
     """
     rng = np.random.default_rng(seed)
@@ -161,7 +165,10 @@ def analyse_saison(w: dict, p: ModVegeParams, a: Annahmen, obs: Beobachtungen | 
     ww = gestoertes_wetter(w, n, rng, cfg)
     gf = modellfehler(n, len(w["tmean"]), rng, cfg)
     fc = None
-    if schnitte is not None and len(schnitte):
+    if schnitt_fenster:
+        # je Schnitt eigenes Fenster [frueh, spaet] (detect_cuts), Tag je Mitglied gleichverteilt
+        fc = np.stack([rng.integers(f, max(f, sp) + 1, n) for f, sp in schnitt_fenster], axis=1)
+    elif schnitte is not None and len(schnitte):
         fc = np.asarray(schnitte, dtype=int)[None, :].repeat(n, axis=0)
         if schnitt_unsicherheit:
             fc = fc + rng.integers(-schnitt_unsicherheit, schnitt_unsicherheit + 1, size=fc.shape)

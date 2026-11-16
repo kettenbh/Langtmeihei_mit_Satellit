@@ -21,6 +21,7 @@ from heu.prices import PRICE_FILE, load_prices, price_forecast
 from heu.weather import date_from_doy, doy365, load_weather, year_arrays
 from heu import satellite as SAT
 from heu import kalibrierung as KAL
+from heu import relativ as REL
 import os
 
 st.set_page_config(page_title="Langt mei Hei?", page_icon="🌾", layout="wide")
@@ -187,7 +188,8 @@ st.caption("MVP mit generischen Annahmen: ein Feld, "
            f"{flaeche:g} ha ({feld_wahl}), {STANDORT.name}. Training: Wetter {A.trainings_start}–{A.trainings_ende}. "
            "Alle Erträge sind Modellwerte, noch nicht mit Betriebsdaten kalibriert.")
 
-tab1, tab2, tabS, tab3, tab4, tab5 = st.tabs(["Ertragsprognose", "Schnittzeitpunkt", "Satellit", f"Wetter {JAHR}", "Heupreise", "Methodik & Annahmen"])
+tab1, tabR, tab2, tabS, tab3, tab4, tab5 = st.tabs(["Ertragsprognose", "% vom Mittel (Satellit)", "Schnittzeitpunkt", "Satellit",
+                                                    f"Wetter {JAHR}", "Heupreise", "Methodik & Annahmen"])
 
 # ---------------------------------------------------------------------------
 # Tab 1: Ertrag
@@ -476,6 +478,115 @@ with tabS:
                            "Seitenleiste (Ziel-Jahresertrag). Mit echten Ertragsdaten (Ballenzahlen je Schnitt) wird es belastbar.")
             elif kp.exists():
                 st.info(f"Kalibrierung vorhanden ({kp.name}). Zum Anzeigen oder Aktualisieren neu kalibrieren (ca. 10 s).")
+
+# ---------------------------------------------------------------------------
+# Tab R: Aufwuchs in % vom Mittel (Hybrid aus Modell und Satellit)
+# ---------------------------------------------------------------------------
+REL_STICHTAGE = list(range(91, 330, 14))
+
+
+@st.cache_resource(show_spinner=False)
+def rel_rechnen(feld_id: str, s2_stand: str, a: Annahmen, token: int, n: int = 32):
+    """Hindcast aller Grünlandjahre und Fächer des laufenden Jahres (ca. 20–40 s, wird gecacht)."""
+    s2_ = SAT.load_cached(feld_id, "s2")
+    s1_ = SAT.load_cached(feld_id, "s1")
+    post, cfg = KAL.prior_fuer_assimilation(feld_id, a)
+    p = M["p"]
+    clim = M["clim"]
+    nutzung = SAT.nutzung_je_jahr(s2_)
+    gr = [y for y in range(2017, JAHR + 1) if nutzung.get(y) == SAT.NUTZUNG_GRUENLAND]
+    basis = [y for y in gr if y < JAHR]
+    hc = REL.hindcast(s2_, s1_, M["df"], basis, p, a, cfg=cfg, posterior=None if post is None else
+                      REL.feste_mitglieder(p, a, 64, cfg, posterior=post))
+    daten = REL.jahr_daten(M["df"], s2_, s1_, gr, clim)
+    ep = REL.feste_mitglieder(p, a, n, cfg, posterior=post)
+    fa = None
+    if JAHR in daten and JAHR in gr:
+        tage = [t for t in REL_STICHTAGE if t < daten[JAHR].n_ist] + [daten[JAHR].n_ist - 1]
+        fa = REL.facher_relativ(JAHR, daten, basis, clim, sorted(set(tage)), p, a, ep, cfg)
+    return dict(hc=hc.tabelle, fa=fa, basis=basis, kalibriert=post is not None, nutzung=nutzung)
+
+
+def statistik_bayern() -> pd.DataFrame | None:
+    f = SAT.DATA_DIR / "statistik_wiesen_bayern.csv"
+    return pd.read_csv(f).set_index("jahr") if f.exists() else None
+
+
+with tabR:
+    st.subheader(f"Aufwuchs {JAHR} in % vom Mittel – Modell und Satellit zusammen")
+    st.caption("Ohne Ballenzahlen ist der absolute Ertrag unsicher. Relativ zum Mittel der Vorjahre kürzt sich alles "
+               "heraus, was das Feld jedes Jahr gleich macht (Ertragsniveau, Boden, Düngung, Umrechnung Satellit ↔ Modell). "
+               "Gezeigt wird der Aufwuchs April bis Oktober (Summe des Zuwachses), nicht die Erntesumme: Die hängt stark "
+               "davon ab, wie oft gemäht wurde.")
+    s2_r = SAT.load_cached(FELD["id"], "s2") if FELD else None
+    if FELD is None or s2_r is None or s2_r.empty:
+        st.info("Dafür braucht es ein echtes Feld mit Satellitendaten: Feld in der Seitenleiste wählen und im Tab "
+                "„Satellit“ die Daten abrufen.")
+    elif os.environ.get("HEU_SYNTHETIC") == "1":
+        st.info("Im Testmodus (Kunstwetter) nicht verfügbar.")
+    else:
+        with st.spinner("Rechne Hindcast und Prognose (beim ersten Mal 20–40 s) …"):
+            R_ = rel_rechnen(FELD["id"], f"{s2_r.index.max():%Y-%m-%d}/{len(s2_r)}", A, st.session_state.token)
+        fa, hc = R_["fa"], R_["hc"]
+        if R_["nutzung"].get(JAHR) != SAT.NUTZUNG_GRUENLAND:
+            st.warning(f"{JAHR} sieht auf diesem Feld nicht nach Grünland aus, deshalb keine Prognose.")
+        elif fa is not None:
+            row = fa.iloc[(fa["stichtag"] - min(STICHTAG, fa["stichtag"].max())).abs().argsort().iloc[0]]
+            c1, c2, c3 = st.columns(3)
+            c1.metric(f"Aufwuchs {JAHR}, Stand {d2date(int(row['stichtag'])):%d.%m.}",
+                      f"{row['p50']:.0f} %", help="Median, 100 % = Mittel der Vorjahre auf diesem Feld")
+            c2.metric("Spanne (80 %)", f"{row['p10']:.0f} – {row['p90']:.0f} %")
+            c3.metric("davon schon gewachsen", f"{row['bisher']:.0f} %",
+                      help="Bis zum Stichtag gewachsener Aufwuchs in % eines mittleren ganzen Jahres")
+            xs = [d2date(int(t)) for t in fa["stichtag"]]
+            fr = go.Figure()
+            fr.add_scatter(x=xs + xs[::-1], y=list(fa["p90"]) + list(fa["p10"])[::-1], fill="toself",
+                           fillcolor="rgba(46,157,91,0.15)", line=dict(width=0), name="80 %-Band")
+            fr.add_scatter(x=xs + xs[::-1], y=list(fa["p75"]) + list(fa["p25"])[::-1], fill="toself",
+                           fillcolor="rgba(46,157,91,0.30)", line=dict(width=0), name="50 %-Band")
+            fr.add_scatter(x=xs, y=fa["p50"], mode="lines+markers", line=dict(color=GRUEN), name="Median")
+            fr.add_scatter(x=xs, y=fa["bisher"], mode="lines", line=dict(color=GRAU, dash="dot"), name="bisher gewachsen")
+            fr.add_hline(y=100, line_color=GRAU, line_dash="dash")
+            fr.add_vline(x=d2date(int(row["stichtag"])), line_color=BLAU, line_dash="dot")
+            fr.update_layout(height=380, margin=dict(t=30, b=10), yaxis_title="% vom Mittel der Vorjahre",
+                             legend=dict(orientation="h", y=1.12))
+            st.plotly_chart(fr, width="stretch")
+            st.caption(f"Je Stichtag: Analyse mit den Satellitenaufnahmen und erkannten Schnitten bis dahin, danach "
+                       f"jedes Wetterjahr {A.trainings_start}–{A.trainings_ende} als mögliches Restwetter. Die Vorjahre "
+                       f"({R_['basis'][0]}–{R_['basis'][-1]}) werden auf demselben Rechenweg zum selben Stichtag gerechnet."
+                       + (" Parameter aus der Feldkalibrierung (Stufe A)." if R_["kalibriert"] else
+                          " Noch ohne Feldkalibrierung (Tab „Satellit“ → „Feld kalibrieren“)."))
+
+        st.subheader("Rückblick: Vorjahre in % vom Mittel der übrigen Jahre")
+        tb = hc[["wetter_pct", "wetter_zw_pct", "hybrid_pct", "hybrid_p10", "hybrid_p90", "licht_pct", "kombi_pct",
+                 "aufnahmen", "schnitte_erkannt"]].copy()
+        stb = statistik_bayern()
+        if stb is not None:
+            sb = {y: v for y, v in stb["wiesen_dt_tm_ha"].items() if y in tb.index}
+            if len(sb) >= 3:
+                tb["bayern_pct"] = pd.Series(REL.relativ_loo(sb))
+        fb = go.Figure()
+        farben = {"wetter_zw_pct": (GRAU, "nur Wetter"), "hybrid_pct": (GRUEN, "Hybrid (Modell + Satellit)"),
+                  "licht_pct": (BLAU, "Satellitenindex"), "bayern_pct": ("#b07aa1", "Statistik Bayern (Wiesen)")}
+        for k, (c, nme) in farben.items():
+            if k in tb:
+                fb.add_bar(x=tb.index, y=tb[k] - 100, base=100, name=nme, marker_color=c)
+        fb.add_hline(y=100, line_color=GRAU, line_dash="dash")
+        fb.update_layout(barmode="group", height=340, margin=dict(t=30, b=10), yaxis_title="% vom Mittel",
+                         legend=dict(orientation="h", y=1.15))
+        st.plotly_chart(fb, width="stretch")
+        anz = tb.rename(columns={"wetter_pct": "Wetter: Ernte", "wetter_zw_pct": "Wetter: Aufwuchs",
+                                 "hybrid_pct": "Hybrid", "hybrid_p10": "Hybrid 10 %", "hybrid_p90": "Hybrid 90 %",
+                                 "licht_pct": "Satellitenindex", "kombi_pct": "Hybrid+Index",
+                                 "bayern_pct": "Statistik Bayern", "aufnahmen": "Aufnahmen",
+                                 "schnitte_erkannt": "Schnitte erkannt"})
+        st.dataframe(anz.sort_index(ascending=False).round(0), width="stretch")
+        st.caption("Alle Werte in % vom Mittel der übrigen Jahre. Satellitenindex = vom Bestand aufgenommenes Licht "
+                   "(Strahlung × Lichtaufnahme aus dem Satelliten-LAI); im Zwillingsexperiment am treffsichersten für "
+                   "den relativen Aufwuchs (mittlerer Fehler 6–8 %-Punkte statt 10–12 bei Wetter allein), hat aber "
+                   "kein Unsicherheitsband und keine Prognose in die Zukunft. Statistik Bayern: Ertrag der Wiesen in "
+                   "Bayern (Landesamt für Statistik, Ernteberichte; 2020 näherungsweise abgeleitet), nur eine grobe "
+                   "Messlatte für Jahre, die überall gut oder schlecht waren.")
 
 # ---------------------------------------------------------------------------
 # Tab 3: Wetter
