@@ -1,4 +1,6 @@
-# Heu-Prognose MVP (Kirchweidach)
+# Langt mei Hei?
+
+Heu-Prognose für die Wiesen in Kirchweidach (Lkr. Altötting), hier mit Satelliten-Datenassimilation.
 
 Streamlit-App, die die Heusaison 2026 für ein generisches Feld (2 ha, Kirchweidach, Lkr. Altötting) **im Rückblick simuliert**:
 Für jeden Stichtag zwischen 1. März und dem letzten Datentag rechnet sie, was eine Prognose an diesem Tag gewusst hätte.
@@ -9,7 +11,7 @@ Das Wetter bis zum Stichtag ist bekannt, danach kommen 35 Szenarien aus den Trai
 Voraussetzung ist Python 3.10 oder neuer (`python3 --version`; sonst `brew install python`).
 
 ```bash
-cd heu-prognose-mvp
+cd Langtmeihei_mit_Satellit
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -83,7 +85,6 @@ Bei langen Wolkenlücken werden Schnitte verpasst.
 ## Aufbau
 
 ```
-app.py            Streamlit-Oberfläche
 heu/config.py     Alle generischen Annahmen (Standort, Ertragsniveau, Schnittregel, Verluste)
 heu/weather.py    Wetterabruf (Open-Meteo), Cache, 365-Tage-Jahre
 heu/model.py      ModVege-Graswachstum, Bodenwasser, Schnittregel, Heuwetter, OMD→NEL
@@ -101,10 +102,14 @@ heu/plots.py      Gemeinsame Diagramme (Band 1991–2025, Histogramm, Trend)
 heu/ui.py         Gecachte Datenlader für alle Seiten
 heu/ensemble.py   ModVege als Ensemble (NumPy, N Mitglieder mit eigenen Parametern/Wetter/Schnitttagen)
 heu/zwilling.py   Zwillingsexperiment: synthetische Wahrheit, S2-LAI-Beobachtungen, Kennzahlen (CRPS)
-pages/            Seiten Futterqualität, Tiergesundheit, Klimatrend
+heu/snap_lai.py   LAI aus Sentinel-2 (SNAP-Biophysik-Netz), Evalscript für CDSE und NumPy-Version
+heu/beobachtung.py  Beobachtungsformat, Fehlermodell, Qualitätskontrolle, Beobachtungsoperatoren
+heu/assimilation.py Ensemble-Kalman-Filter mit erweitertem Zustand, Saison-Analyse, Prognose ab Analyse
+app.py            Einstieg mit Navigation (Langt mei Hei?, Futterqualität, Tiergesundheit, Klimatrend)
+app_pages/        Hauptseite 0_Langt_mei_Hei.py und Seiten Futterqualität, Tiergesundheit, Klimatrend
 scripts/selftest.py  Funktionstest ohne Internet
 scripts/benchmark_ensemble.py  Laufzeit Skalar- gegen Ensemble-Modell
-scripts/twin_experiment.py     Zwillingsexperiment (derzeit Open-Loop-Messlatte ohne Assimilation)
+scripts/twin_experiment.py     Zwillingsexperiment EnKF gegen Open Loop
 tests/            Regressionstests (pip install -r requirements-dev.txt; python -m pytest -q tests/)
 docs/PLAN_hybridmodell_assimilation.md  Plan Hybridmodell mit Satelliten-Datenassimilation
 ```
@@ -118,7 +123,14 @@ Dieses Repo ist die Weiterentwicklung der Demo-App `heu-prognose-mvp` um die Dat
   stimmen mit `heu/model.py` bis auf Rundungsfehler überein (`tests/test_ensemble.py`). 64 Mitglieder ×
   35 Wetterjahre laufen etwa 20-mal schneller als mit der Skalarversion. Das Zwillingsexperiment liefert die
   Open-Loop-Messlatte.
-- Als Nächstes: LAI-Beobachtungen aus Sentinel-2 (Paket 2) und der EnKF (Paket 3).
+- **Paket 2 (fertig):** Der Sentinel-2-Abruf liefert zusätzlich den LAI (SNAP-Netz, CC BY-SA 4.0, siehe
+  `heu/snap_lai.py`). Ein vorhandener S2-Cache ohne LAI-Spalte wird beim nächsten Abruf einmal komplett neu
+  geladen. `heu/beobachtung.py` prüft die Aufnahmen (Wolken, Winter, frisch gemäht, Ausreißer).
+- **Paket 3 (fertig, nur synthetisch geprüft):** `heu/assimilation.py` mit EnKF. Im Zwillingsexperiment
+  (Wahrheit NI 0,55 statt 0,70) sinkt der Fehler im Jahresertrag von 15,7 auf 3,8 dt TM/ha und bei der Prognose
+  am 15. Mai von 17,2 auf 9,4 dt TM/ha.
+- Als Nächstes: Kalibrierung je Feld über 2017–2025 (Paket 5), Prognose-Umbau (6), Oberfläche (7), Hindcast mit
+  echten Daten auf dem Mac (8).
 
 ## Wichtige Grenzen
 

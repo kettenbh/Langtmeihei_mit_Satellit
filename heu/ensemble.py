@@ -372,7 +372,7 @@ def run_ensemble(w: dict, p: EnsembleParams, a: Annahmen, state: EnsembleState |
         An diesen Tagen wird unabhängig von der Regel geschnitten (Analysephase, Plan 3.4).
     gro_factor: optional (Tage, n) oder (n,) Faktor auf den Zuwachs (Modellfehler, Plan 3.2).
     trace: wenn True, wird zusätzlich ein Dict mit Tageswerten (Tage, n) zurückgegeben:
-        biomasse, H, omd, W, ST, n_cuts, lai (wie die Spalten 1-7 des Skalar-Trace).
+        biomasse, H, omd, W, ST, n_cuts, lai (wie die Spalten 1-7 des Skalar-Trace), gro (Bruttozuwachs kg TM/ha).
 
     Der Zustand wird in place verändert und zurückgegeben (plus Trace, falls verlangt).
     """
@@ -390,7 +390,7 @@ def run_ensemble(w: dict, p: EnsembleParams, a: Annahmen, state: EnsembleState |
         if fc.ndim == 1:
             fc = np.broadcast_to(fc, (s.n, len(fc)))
     gf = None if gro_factor is None else np.asarray(gro_factor, dtype=float)
-    rec = {k: [] for k in ("biomasse", "H", "omd", "W", "ST", "n_cuts", "lai")} if trace else None
+    rec = {k: [] for k in ("biomasse", "H", "omd", "W", "ST", "n_cuts", "lai", "gro")} if trace else None
 
     for d in range(start, end):
         if forced_cuts is not None and fc.size:
@@ -410,8 +410,9 @@ def run_ensemble(w: dict, p: EnsembleParams, a: Annahmen, state: EnsembleState |
         g = None
         if gf is not None:
             g = gf[d] if gf.ndim == 2 else gf
-        grow_ensemble_day(s, _col(tm, d), _col(rad, d), _col(rain, d), _col(et0, d), p, g)
+        gro = grow_ensemble_day(s, _col(tm, d), _col(rad, d), _col(rain, d), _col(et0, d), p, g)
         if trace:
+            rec["gro"].append(np.broadcast_to(gro, (s.n,)).copy())
             H, omd, _ = harvestable(s, p, a.schnitthoehe_m)
             rec["biomasse"].append(s.GV + s.GR + s.DV + s.DR)
             rec["H"].append(H)

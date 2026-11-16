@@ -4,8 +4,8 @@ Idee: Ein "wahres" Feld wird mit bekannten, absichtlich anderen Parametern simul
 synthetische Sentinel-2-LAI-Beobachtungen mit Wolkenlücken und Messfehler. Ein Prior-Ensemble mit den
 Standardannahmen der App läuft dann gegen diese Wahrheit.
 
-Paket 1 liefert die Bausteine und den Open-Loop-Lauf (Ensemble ohne Korrektur) als Messlatte.
-Paket 3 setzt den EnKF-Schritt an den Beobachtungstagen dazwischen und muss besser abschneiden.
+Paket 1 lieferte die Bausteine und den Open-Loop-Lauf (Ensemble ohne Korrektur) als Messlatte.
+Paket 3 (heu/assimilation.py) setzt den EnKF-Schritt an den Beobachtungstagen dazwischen.
 """
 from __future__ import annotations
 
@@ -18,20 +18,7 @@ from .config import Annahmen
 from .model import ModVegeParams
 
 
-# ---------------------------------------------------------------------------
-# Beobachtungsfehler (Plan 3.2)
-# ---------------------------------------------------------------------------
-def lai_sigma(lai, clear, rel: float = 0.25, minimum: float = 0.5):
-    """Standardabweichung des S2-LAI: max(0,5; 0,25·LAI) × (1 + 2·(1 − Klar-Anteil))."""
-    return np.maximum(minimum, rel * np.asarray(lai)) * (1.0 + 2.0 * (1.0 - np.asarray(clear)))
-
-
-@dataclass
-class Beobachtungen:
-    tag: np.ndarray        # 0-basierter Tag im 365-Tage-Jahr
-    lai: np.ndarray        # beobachteter LAI
-    sigma: np.ndarray      # angenommener Beobachtungsfehler
-    clear: np.ndarray      # Anteil wolkenfreier Feldpixel
+from .beobachtung import Beobachtungen, lai_sigma  # noqa: E402  (Fehlermodell aus Plan 3.2)
 
 
 def synthetische_lai(lai_wahr: np.ndarray, rng: np.random.Generator, revisit: int = 5,
@@ -50,7 +37,7 @@ def synthetische_lai(lai_wahr: np.ndarray, rng: np.random.Generator, revisit: in
         werte.append(max(0.0, lai_wahr[d] + bias + rng.normal(0.0, s)))
         sig.append(s)
         clr.append(c)
-    return Beobachtungen(np.array(tage, dtype=int), np.array(werte), np.array(sig), np.array(clr))
+    return Beobachtungen(np.array(tage, dtype=int), np.array(werte), np.array(sig), np.array(clr), "lai")
 
 
 # ---------------------------------------------------------------------------
@@ -131,3 +118,34 @@ def open_loop(w: dict, wahr: Wahrheit, p_prior: ModVegeParams, a: Annahmen, n: i
 
 def wahre_parameter(p: ModVegeParams, **abweichung) -> ModVegeParams:
     return replace(p, **abweichung)
+
+
+CI_REF_NIEDERHAM = (6.08, 0.45, -0.98)   # heu.ndre.referenz(Niederham 2017–2026): a, b, c
+
+
+def synthetische_s2_reihe(lai: np.ndarray, jahr: int, rng: np.random.Generator, dunst: float = 0.05,
+                          p_bewoelkt: float = 0.55, lai_rel: float = 0.25, ni_rel: np.ndarray | None = None,
+                          ndre_sigma: float = 0.10, ci_ref=CI_REF_NIEDERHAM, gamma: float = 1.0):
+    """S2-Cache-ähnliche Tabelle (wie satellite.load_cached) aus einer wahren LAI-Reihe: Überflug alle
+    5 Tage, p_bewoelkt unbrauchbar, NDVI = 0,91 − 0,70·exp(−0,96·LAI) + N(0; 0,035) (angepasst an 406 klare
+    Aufnahmen von Wiese Ost/West), LAI mit relativem Fehler lai_rel, Anteil `dunst` der klaren Aufnahmen
+    als unerkannter Dunst (NDVI −0,15…−0,45, LAI ×0,5…0,9).
+    NDRE über den Chlorophyll-Index: CIre = ref(LAI_beob)·ni_rel^gamma·exp(N(0; ndre_sigma)), ref wie heu.ndre
+    (Niederham), ni_rel = wahrer N-Status relativ zum Feldmittel je Tag (Standard 1)."""
+    import datetime as dt
+    import pandas as pd
+    rows = []
+    for d in range(int(rng.integers(0, 5)), 365, 5):
+        if rng.random() < p_bewoelkt:
+            continue
+        nd = 0.91 - 0.70 * np.exp(-0.96 * lai[d]) + rng.normal(0, 0.035)
+        lo = max(0.0, lai[d] * (1 + rng.normal(0, lai_rel)))
+        if rng.random() < dunst:
+            nd -= rng.uniform(0.15, 0.45)
+            lo *= rng.uniform(0.5, 0.9)
+        a_, b_, c_ = ci_ref
+        ci = max(0.05, a_ * (1 - np.exp(-b_ * lo)) + c_) * (1.0 if ni_rel is None else ni_rel[d]) ** gamma \
+            * np.exp(rng.normal(0, ndre_sigma))
+        rows.append({"date": pd.Timestamp(dt.date(jahr, 1, 1) + dt.timedelta(days=d)), "clear": 1.0,
+                     "ndvi": nd, "lai": lo, "ndre": ci / (ci + 2)})
+    return pd.DataFrame(rows).set_index("date")

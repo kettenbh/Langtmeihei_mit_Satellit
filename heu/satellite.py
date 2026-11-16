@@ -1,4 +1,4 @@
-"""Satellitendaten je Feld: Sentinel-2 (NDVI, NDRE) und Sentinel-1 (VV/VH), Schnitterkennung.
+"""Satellitendaten je Feld: Sentinel-2 (NDVI, NDRE, LAI) und Sentinel-1 (VV/VH), Schnitterkennung.
 
 Zwei Wege:
   1. CDSE Sentinel Hub Statistical API (empfohlen): braucht einen kostenlosen OAuth-Client,
@@ -22,32 +22,17 @@ import pandas as pd
 import requests
 
 from .config import DATA_DIR, ROOT
+from .snap_lai import evalscript_s2, lai_numpy
 
 FIELDS_FILE = DATA_DIR / "felder.geojson"
 TOKEN_URL = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
 STATS_URL = "https://sh.dataspace.copernicus.eu/api/v1/statistics"
+PROCESS_URL = "https://sh.dataspace.copernicus.eu/api/v1/process"
 S2_START = dt.date(2017, 3, 1)
 MIN_CLEAR = 0.8           # Mindestanteil wolkenfreier Feldpixel
 INNER_BUFFER_M = 10.0     # Randpixel (Wege, Hecken, Wald) ausschließen
 
-EVAL_S2 = """//VERSION=3
-function setup() {
-  return {
-    input: [{bands: ["B04", "B05", "B08", "B8A", "SCL", "dataMask"]}],
-    output: [
-      {id: "ndvi", bands: 1, sampleType: "FLOAT32"},
-      {id: "ndre", bands: 1, sampleType: "FLOAT32"},
-      {id: "dataMask", bands: 1}
-    ]
-  };
-}
-function evaluatePixel(s) {
-  // SCL 4 = Vegetation, 5 = unbewachsen; Wolken, Schatten, Schnee, Wasser fallen heraus
-  var ok = (s.SCL == 4 || s.SCL == 5) ? 1 : 0;
-  var ndvi = (s.B08 - s.B04) / (s.B08 + s.B04 + 1e-6);
-  var ndre = (s.B8A - s.B05) / (s.B8A + s.B05 + 1e-6);
-  return {ndvi: [ndvi], ndre: [ndre], dataMask: [s.dataMask * ok]};
-}"""
+EVAL_S2 = evalscript_s2()   # NDVI, NDRE, LAI (SNAP-Netz), siehe heu/snap_lai.py
 
 EVAL_S1 = """//VERSION=3
 function setup() {
@@ -162,6 +147,86 @@ class CDSE:
         raise RuntimeError("CDSE: zu viele Anfragen, bitte später erneut versuchen")
 
 
+    def process(self, body: dict) -> bytes:
+        """Process API: liefert ein Bild (PNG-Bytes)."""
+        for attempt in range(4):
+            r = requests.post(PROCESS_URL, json=body, timeout=120,
+                              headers={"Authorization": f"Bearer {self.token()}", "Accept": "image/png"})
+            if r.status_code == 429:
+                time.sleep(5 * (attempt + 1))
+                continue
+            if r.status_code >= 400:
+                raise RuntimeError(f"CDSE {r.status_code}: {r.text[:400]}")
+            return r.content
+        raise RuntimeError("CDSE: zu viele Anfragen, bitte später erneut versuchen")
+
+
+EVAL_TRUECOLOR = """//VERSION=3
+function setup() { return {input: ["B02", "B03", "B04", "dataMask"], output: {bands: 4}}; }
+function evaluatePixel(s) { var g = 2.8; return [g * s.B04, g * s.B03, g * s.B02, s.dataMask]; }"""
+
+EVAL_NDVI = """//VERSION=3
+function setup() { return {input: ["B04", "B08", "SCL", "dataMask"], output: {bands: 4}}; }
+function evaluatePixel(s) {
+  if ([3, 8, 9, 10].indexOf(s.SCL) >= 0) { return [0.85, 0.85, 0.85, s.dataMask]; }   // Wolke/Schatten grau
+  var v = (s.B08 - s.B04) / (s.B08 + s.B04 + 1e-6);
+  var stops = [[0.0, [0.65, 0.45, 0.25]], [0.3, [0.85, 0.75, 0.4]], [0.5, [0.75, 0.85, 0.35]],
+               [0.7, [0.35, 0.7, 0.25]], [0.9, [0.05, 0.4, 0.1]]];
+  var c = stops[0][1];
+  for (var i = 1; i < stops.length; i++) {
+    if (v >= stops[i][0]) { c = stops[i][1]; continue; }
+    var a = stops[i - 1], b = stops[i], t = (v - a[0]) / (b[0] - a[0]);
+    c = [a[1][0] + t * (b[1][0] - a[1][0]), a[1][1] + t * (b[1][1] - a[1][1]), a[1][2] + t * (b[1][2] - a[1][2])];
+    break;
+  }
+  return [c[0], c[1], c[2], s.dataMask];
+}"""
+
+
+def bild_datum(s2: pd.DataFrame | None, stichtag: dt.date, max_tage: int = 30) -> dt.date | None:
+    """Letzte klare Aufnahme (Cache) am oder vor dem Stichtag, höchstens max_tage zurück."""
+    if s2 is None or s2.empty:
+        return None
+    c = s2[(s2["clear"] >= MIN_CLEAR) & (s2.index <= pd.Timestamp(stichtag))
+           & (s2.index >= pd.Timestamp(stichtag - dt.timedelta(days=max_tage)))]
+    return c.index.max().date() if len(c) else None
+
+
+def feld_bbox(field: dict, rand_m: float = 120.0) -> tuple[float, float, float, float]:
+    ring = field["geometry"]["coordinates"][0]
+    lon = [c[0] for c in ring]
+    lat = [c[1] for c in ring]
+    rx, ry = _res_deg(float(np.mean(lat)), rand_m)
+    return min(lon) - rx, min(lat) - ry, max(lon) + rx, max(lat) + ry
+
+
+def satellitenbild(field: dict, datum: dt.date, art: str = "truecolor", fenster_tage: int = 0,
+                   creds: tuple[str, str] | None = None, aufloesung_m: float = 10.0) -> tuple[bytes, tuple]:
+    """Sentinel-2-Bild (PNG) um das Feld, spontan über die CDSE Process API (ohne Cache).
+    fenster_tage = 0: genau dieser Tag; sonst die wolkenärmste Aufnahme in [datum − fenster, datum].
+    Gibt (PNG-Bytes, bbox lon/lat) zurück."""
+    creds = creds or cdse_credentials()
+    if not creds:
+        raise RuntimeError("Kein CDSE-Zugang hinterlegt (.streamlit/secrets.toml, Abschnitt [cdse]).")
+    bbox = feld_bbox(field)
+    lat = 0.5 * (bbox[1] + bbox[3])
+    rx, ry = _res_deg(lat, aufloesung_m)
+    w = max(16, int(round((bbox[2] - bbox[0]) / rx)))
+    h = max(16, int(round((bbox[3] - bbox[1]) / ry)))
+    von = datum - dt.timedelta(days=fenster_tage)
+    body = {
+        "input": {
+            "bounds": {"bbox": list(bbox), "properties": {"crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"}},
+            "data": [{"type": "sentinel-2-l2a",
+                      "dataFilter": {"timeRange": {"from": f"{von}T00:00:00Z", "to": f"{datum}T23:59:59Z"},
+                                     "mosaickingOrder": "leastCC"}}],
+        },
+        "output": {"width": w, "height": h, "responses": [{"identifier": "default", "format": {"type": "image/png"}}]},
+        "evalscript": EVAL_NDVI if art == "ndvi" else EVAL_TRUECOLOR,
+    }
+    return CDSE(*creds).process(body), bbox
+
+
 def _res_deg(lat: float, meters: float) -> tuple[float, float]:
     return meters / (111320 * math.cos(math.radians(lat))), meters / 110540
 
@@ -194,6 +259,9 @@ def _parse_stats(js: dict, outputs: list[str]) -> pd.DataFrame:
         for o in outputs:
             st_ = item["outputs"][o]["bands"]["B0"]["stats"]
             n, nod = st_.get("sampleCount", 0), st_.get("noDataCount", 0)
+            # sampleCount zählt alle Pixel der Bounding Box, auch außerhalb des Feldes. Der rohe Anteil
+            # erreicht deshalb nie 1; normiere_clear() rechnet ihn auf die Feldpixel um.
+            r["valid_px"], r["sample_px"] = n - nod, n
             r["clear"] = (n - nod) / n if n else 0.0
             if n - nod <= 0:
                 r[o] = r[f"{o}_q25"] = r[f"{o}_q75"] = np.nan
@@ -202,6 +270,7 @@ def _parse_stats(js: dict, outputs: list[str]) -> pd.DataFrame:
             r[o] = pc.get("50.0", st_.get("mean"))
             r[f"{o}_q25"], r[f"{o}_q75"] = pc.get("25.0"), pc.get("75.0")
             r[f"{o}_mean"] = st_.get("mean")
+            r[f"{o}_std"] = st_.get("stDev")
         rows.append(r)
     df = pd.DataFrame(rows)
     if df.empty:
@@ -219,7 +288,7 @@ def fetch_cdse(field: dict, kind: str, start: dt.date, end: dt.date, client: CDS
         if kind == "s2":
             data = {"type": "sentinel-2-l2a", "dataFilter": {"maxCloudCoverage": 90}}
             js = client.statistics(_stats_body(geom, field["lat"], y0, y1, data, EVAL_S2, 10))
-            parts.append(_parse_stats(js, ["ndvi", "ndre"]))
+            parts.append(_parse_stats(js, ["ndvi", "ndre", "lai"]))
         else:
             data = {"type": "sentinel-1-grd",
                     "dataFilter": {"acquisitionMode": "IW", "polarization": "DV", "resolution": "HIGH",
@@ -271,7 +340,7 @@ def fetch_earth_search(field: dict, start: dt.date, end: dt.date, progress=None)
                 xs = [p[0] for p in g["coordinates"][0]]
                 ys = [p[1] for p in g["coordinates"][0]]
                 bounds = (min(xs), min(ys), max(xs), max(ys))
-            for key in ("red", "nir", "rededge1", "nir08", "scl"):
+            for key in ("green", "red", "rededge1", "rededge2", "rededge3", "nir", "nir08", "swir16", "swir22", "scl"):
                 a = it.assets[key]
                 with rasterio.open(a.href) as src:
                     win = from_bounds(*bounds, transform=src.transform).round_offsets().round_lengths()
@@ -289,8 +358,18 @@ def fetch_earth_search(field: dict, start: dt.date, end: dt.date, progress=None)
                 continue
             ndvi = (arrs["nir"] - arrs["red"]) / (arrs["nir"] + arrs["red"] + 1e-6)
             ndre = (arrs["nir08"] - arrs["rededge1"]) / (arrs["nir08"] + arrs["rededge1"] + 1e-6)
+            # LAI (SNAP-Netz). Winkel aus den STAC-Metadaten; fehlt der Beobachtungswinkel, gilt
+            # näherungsweise nadirnah (5°) und senkrechter relativer Azimut (Fallback, ungenauer als CDSE).
+            pr = it.properties
+            sun_zen = 90.0 - float(pr.get("view:sun_elevation", 45.0))
+            sun_az = float(pr.get("view:sun_azimuth", 160.0))
+            view_zen = float(pr.get("view:incidence_angle", pr.get("s2:mean_incidence_zenith_angle", 5.0)))
+            view_az = float(pr.get("view:azimuth", pr.get("s2:mean_incidence_azimuth_angle", sun_az - 90.0)))
+            lai = lai_numpy({"B03": arrs["green"], "B04": arrs["red"], "B05": arrs["rededge1"],
+                             "B06": arrs["rededge2"], "B07": arrs["rededge3"], "B8A": arrs["nir08"],
+                             "B11": arrs["swir16"], "B12": arrs["swir22"]}, view_zen, sun_zen, sun_az, view_az)
             r = {"date": pd.Timestamp(day), "clear": ok.sum() / n}
-            for name, v in (("ndvi", ndvi), ("ndre", ndre)):
+            for name, v in (("ndvi", ndvi), ("ndre", ndre), ("lai", lai)):
                 vv = v[ok]
                 r[name] = np.median(vv) if len(vv) else np.nan
                 r[f"{name}_q25"] = np.percentile(vv, 25) if len(vv) else np.nan
@@ -306,6 +385,31 @@ def fetch_earth_search(field: dict, start: dt.date, end: dt.date, progress=None)
 # ---------------------------------------------------------------------------
 # Cache
 # ---------------------------------------------------------------------------
+def normiere_clear(df: pd.DataFrame, min_treffer: int = 3) -> pd.DataFrame:
+    """Klar-Anteil bezogen auf die Feldpixel statt auf die Bounding Box.
+
+    Die Statistical API zählt in sampleCount alle Pixel des umschließenden Rechtecks. Pixel außerhalb
+    des Feldes sind immer noData, deshalb lag der rohe Anteil bei Wiese Ost höchstens bei 0,70.
+    Bezug ist die größte Zahl gültiger Pixel der Reihe (= wolkenfreie Aufnahme). Normiert wird nur,
+    wenn mindestens `min_treffer` Aufnahmen diesen Wert (±2 %) erreichen. Ältere Caches ohne Pixelzahlen
+    werden über den größten Klar-Anteil normiert. Mehrfaches Anwenden ändert nichts.
+    """
+    if df is None or df.empty or "clear" not in df:
+        return df
+    df = df.copy()
+    if "valid_px" in df and df["valid_px"].notna().any():
+        v = df["valid_px"].astype(float)
+        ref = v.max()
+        if ref > 0 and (v >= 0.98 * ref).sum() >= min_treffer:
+            df["clear"] = np.where(v.notna(), (v / ref).clip(upper=1.0), df["clear"])
+        return df
+    c = df["clear"].astype(float)
+    ref = c.max()
+    if 0 < ref < 0.98 and (c >= 0.98 * ref).sum() >= min_treffer:
+        df["clear"] = (c / ref).clip(upper=1.0)
+    return df
+
+
 def cache_path(field_id: str, kind: str):
     return DATA_DIR / f"sat_{kind}_{field_id}.csv"
 
@@ -314,7 +418,8 @@ def load_cached(field_id: str, kind: str) -> pd.DataFrame | None:
     p = cache_path(field_id, kind)
     if not p.exists():
         return None
-    return pd.read_csv(p, parse_dates=["date"], index_col="date")
+    df = pd.read_csv(p, parse_dates=["date"], index_col="date")
+    return normiere_clear(df) if kind == "s2" else df
 
 
 def update(field: dict, backend: str = "auto", progress=None) -> dict[str, pd.DataFrame]:
@@ -329,6 +434,8 @@ def update(field: dict, backend: str = "auto", progress=None) -> dict[str, pd.Da
     kinds = ("s2", "s1") if use_cdse else ("s2",)
     for kind in kinds:
         old = load_cached(field["id"], kind)
+        if kind == "s2" and old is not None and "lai" not in old.columns:
+            old = None   # Cache aus der Zeit vor dem LAI-Evalscript: einmal komplett neu laden
         start = S2_START if old is None or old.empty else (old.index.max().date() - dt.timedelta(days=10))
         if progress:
             progress(0.0, f"{field['name']}: {kind.upper()} ab {start}")
@@ -336,6 +443,8 @@ def update(field: dict, backend: str = "auto", progress=None) -> dict[str, pd.Da
         df = new if old is None else pd.concat([old[old.index < pd.Timestamp(start)], new])
         if not df.empty:
             df = df[~df.index.duplicated(keep="last")].sort_index()
+            if kind == "s2" and use_cdse:
+                df = normiere_clear(df)
             df.to_csv(cache_path(field["id"], kind), index_label="date")
         out[kind] = df
     if "s1" not in out:
@@ -346,49 +455,158 @@ def update(field: dict, backend: str = "auto", progress=None) -> dict[str, pd.Da
 # ---------------------------------------------------------------------------
 # Schnitterkennung
 # ---------------------------------------------------------------------------
-def detect_cuts(s2: pd.DataFrame, s1: pd.DataFrame | None = None, min_drop: float = 0.15,
-                min_before: float = 0.6, max_gap_days: int = 25, min_sep_days: int = 25) -> pd.DataFrame:
-    """Schnitt = NDVI-Abfall um mindestens min_drop zwischen zwei klaren Aufnahmen
-    (vorher ≥ min_before, Abstand ≤ max_gap_days). Geschätztes Datum: Mitte zwischen den Aufnahmen.
-    Sentinel-1: Abfall der VH-Rückstreuung um ≥ 1 dB im selben Zeitraum gilt als Bestätigung."""
-    if s2 is None or s2.empty:
-        return pd.DataFrame(columns=["datum", "frueh", "spaet", "ndvi_vor", "ndvi_nach", "unsicherheit_tage", "s1_bestaetigt"])
+NUTZUNG_GRUENLAND = "Grünland"
+NUTZUNG_ACKER = "Acker/Umbruch"
+
+
+def nutzung_je_jahr(s2: pd.DataFrame, max_ndvi_offen: float = 0.3, min_offen: int = 2,
+                    gruen_ndvi: float = 0.6, gruen_tage: int = 20) -> dict[int, str]:
+    """Nutzung je Jahr aus der NDVI-Reihe: Grünland ist von März bis Oktober nie großflächig offen.
+
+    Ein Jahr gilt als "Acker/Umbruch", wenn mindestens `min_offen` klare Aufnahmen von März bis Oktober
+    einen Feld-Median-NDVI unter `max_ndvi_offen` haben (offener Boden: Saatbett, Stoppel nach der
+    Getreideernte, Umbruch). Eine einzelne Aufnahme reicht nicht, weil Dunst, den die SCL-Maske nicht
+    erkennt, einzelne Tage auf NDVI 0,1 bis 0,2 drücken kann (z. B. 29.10.2024 auf allen drei Feldern).
+    Gemähtes Grünland bleibt dagegen über 0,45, auch in Trockenphasen.
+    Eine offene Aufnahme zählt nicht, wenn innerhalb von `gruen_tage` danach wieder eine klare Aufnahme mit
+    NDVI ≥ `gruen_ndvi` folgt: Saatbett, Umbruch oder Stoppel brauchen Wochen bis dahin, Dunst nicht.
+    """
+    if s2 is None or s2.empty or "ndvi" not in s2:
+        return {}
+    c = s2[(s2["clear"] >= MIN_CLEAR) & s2["ndvi"].notna()]
+    out = {}
+    for y in sorted(set(s2.index.year)):
+        d = c[(c.index.year == y) & (c.index.month >= 3) & (c.index.month <= 10)]
+        nd, tage = d["ndvi"].to_numpy(), d.index
+        offen = 0
+        for i in np.flatnonzero(nd < max_ndvi_offen):
+            danach = (tage > tage[i]) & (tage <= tage[i] + pd.Timedelta(days=gruen_tage))
+            if not (nd[danach] >= gruen_ndvi).any():
+                offen += 1
+        out[int(y)] = NUTZUNG_ACKER if offen >= min_offen else NUTZUNG_GRUENLAND
+    return out
+
+
+SCHNITT_SPALTEN = ["datum", "frueh", "spaet", "ndvi_vor", "ndvi_nach", "lai_vor", "lai_nach",
+                   "unsicherheit_tage", "s1_bestaetigt", "kriterium", "nutzung"]
+
+
+def detect_cuts(s2: pd.DataFrame, s1: pd.DataFrame | None = None, min_before: float = 0.6,
+                ndvi_drop: float = 0.12, ndvi_drop_stark: float = 0.2, lai_min_vor: float = 1.5,
+                lai_drop_rel: float = 0.35, lai_max_nach: float = 3.0, lai_ndvi_drop: float = 0.04,
+                fenster_tage: int = 40, max_gap_days: int = 40, min_sep_days: int = 25,
+                rebound_days: int = 12, min_ndvi_nach: float = 0.25, nur_gruenland: bool = True) -> pd.DataFrame:
+    """Schnitte als Einbruch von einem Hoch auf ein Tief (klare Aufnahmen April bis Oktober).
+
+    Kandidat ist jedes Tief: eine Aufnahme, nach der der NDVI wieder steigt, die nächste Aufnahme mehr
+    als 15 Tage später kommt oder die letzte des Jahres.
+    Das Hoch ist die Aufnahme mit dem größten LAI (ohne LAI: NDVI) in den fenster_tage davor. So wird
+    auch ein Schnitt erkannt, der sich über mehrere Aufnahmen verteilt (Mähen, Heu liegt einige Tage,
+    Abfahren), was paarweise Vergleiche bei dichter Aufnahmefolge übersehen. Ein Schnitt liegt vor, wenn
+    der NDVI am Hoch ≥ min_before war und
+      (a) der LAI um mindestens lai_drop_rel (relativ) fällt, am Hoch ≥ lai_min_vor, am Tief ≤ lai_max_nach,
+          und der NDVI gleichzeitig um mindestens lai_ndvi_drop sinkt ("LAI"), oder
+      (b) der NDVI um mindestens ndvi_drop_stark fällt ("NDVI stark"), oder
+      (c) der NDVI um mindestens ndvi_drop fällt und der LAI dabei sinkt ("NDVI").
+    Der LAI reagiert auf einen Schnitt deutlich stärker als der NDVI, der bei Grünland wegen der grünen
+    Stoppel oft nur um 0,05 bis 0,15 fällt. Die NDVI-Bedingung in (a) fängt einzelne LAI-Ausreißer ab.
+
+    Artefakte (Dunst, Schatten, den die SCL-Maske nicht erkennt):
+      - Tief unter min_ndvi_nach: gemähtes Grünland bleibt grün, so tiefe Werte sind Umbruch oder Dunst;
+      - die nächste klare Aufnahme innerhalb rebound_days erreicht wieder NDVI und 90 % des LAI vom Hoch.
+
+    Zeitfenster: "frueh" ist die letzte Aufnahme, die noch nahe am Hoch liegt, "spaet" die erste, die
+    schon nahe am Tief liegt (je 25 % der NDVI-Spanne). Datum = Mitte, Unsicherheit = halber Abstand;
+    liegen mehr als max_gap_days dazwischen, wird der Kandidat verworfen. Treffer mit weniger als
+    min_sep_days Abstand werden zusammengefasst (stärkerer Einbruch gewinnt).
+    Sentinel-1: Abfall der VH-Rückstreuung um ≥ 1 dB im selben Zeitraum gilt als Bestätigung.
+    In Jahren, die nutzung_je_jahr als Acker/Umbruch einstuft, ist ein NDVI-Abfall meist Ernte,
+    Abreife oder Umbruch; diese Jahre werden mit nur_gruenland=True übersprungen.
+    """
+    leer = pd.DataFrame({c: pd.Series(dtype="datetime64[ns]" if c in ("datum", "frueh", "spaet") else
+                                      ("object" if c in ("kriterium", "nutzung", "s1_bestaetigt") else "float"))
+                         for c in SCHNITT_SPALTEN})
+    if s2 is None or s2.empty or "ndvi" not in s2:
+        return leer
+    nutzung = nutzung_je_jahr(s2)
     c = s2[(s2["clear"] >= MIN_CLEAR) & s2["ndvi"].notna()]
     c = c[(c.index.month >= 4) & (c.index.month <= 10)]
     rows = []
-    dates, vals = list(c.index), list(c["ndvi"])
-    for i in range(1, len(dates)):
-        gap = (dates[i] - dates[i - 1]).days
-        drop = vals[i - 1] - vals[i]
-        if gap <= max_gap_days and drop >= min_drop and vals[i - 1] >= min_before:
-            mid = dates[i - 1] + (dates[i] - dates[i - 1]) / 2
+    for jahr in sorted(set(c.index.year)):
+        nu = nutzung.get(int(jahr), NUTZUNG_GRUENLAND)
+        if nur_gruenland and nu != NUTZUNG_GRUENLAND:
+            continue
+        cj = c[c.index.year == jahr]
+        dates = list(cj.index)
+        nd = cj["ndvi"].to_numpy(dtype=float)
+        la = cj["lai"].to_numpy(dtype=float) if "lai" in cj else np.full(len(cj), np.nan)
+        for i in range(1, len(dates)):
+            if i + 1 < len(dates) and nd[i + 1] < nd[i] and (dates[i + 1] - dates[i]).days <= 15:
+                continue                                    # kein Tief: es geht gleich weiter abwärts
+            fen = [j for j in range(i) if (dates[i] - dates[j]).days <= fenster_tage]
+            if not fen:
+                continue
+            lai_ok = np.isfinite(la[i]) and all(np.isfinite(la[j]) for j in fen)
+            h = max(fen, key=lambda j: la[j]) if lai_ok else max(fen, key=lambda j: nd[j])
+            d_ndvi = max(nd[j] for j in fen if j >= h) - nd[i]
+            nd_hoch = nd[h]
+            if nd_hoch < min_before or d_ndvi <= 0:
+                continue
+            rel = (la[h] - la[i]) / la[h] if lai_ok and la[h] > 0 else np.nan
+            krit = None
+            if lai_ok and la[h] >= lai_min_vor and rel >= lai_drop_rel and la[i] <= lai_max_nach \
+                    and d_ndvi >= lai_ndvi_drop:
+                krit = "LAI"
+            elif d_ndvi >= ndvi_drop_stark:
+                krit = "NDVI stark"
+            elif d_ndvi >= ndvi_drop and (not lai_ok or rel > 0):
+                krit = "NDVI"
+            if krit is None or nd[i] < min_ndvi_nach:
+                continue
+            if i + 1 < len(dates) and (dates[i + 1] - dates[i]).days <= rebound_days:
+                nd_back = nd[i + 1] >= nd_hoch - 0.03
+                la_back = (not lai_ok) or (np.isfinite(la[i + 1]) and la[i + 1] >= 0.9 * la[h])
+                if nd_back and la_back:
+                    continue
+            # Zeitfenster eingrenzen
+            hi_ref = max(nd[j] for j in range(h, i))
+            span = hi_ref - nd[i]
+            f = max(j for j in range(h, i) if nd[j] >= hi_ref - 0.25 * span)
+            s_ = min(j for j in range(f + 1, i + 1) if nd[j] <= nd[i] + 0.25 * span)
+            a, b = dates[f], dates[s_]
+            gap = (b - a).days
+            if gap > max_gap_days:
+                continue
+            mid = a + (b - a) / 2
             conf = None
             if s1 is not None and not s1.empty and "vh_db" in s1:
-                w = s1.loc[dates[i - 1] - pd.Timedelta(days=12): dates[i] + pd.Timedelta(days=12), "vh_db"].dropna()
-                if len(w) >= 2:
-                    before = w[w.index <= mid]
-                    after = w[w.index > mid]
-                    if len(before) and len(after):
-                        conf = bool(before.iloc[-1] - after.iloc[0] >= 1.0)
-            rows.append({"datum": mid.normalize(), "frueh": dates[i - 1], "spaet": dates[i],
-                         "ndvi_vor": round(vals[i - 1], 3), "ndvi_nach": round(vals[i], 3),
-                         "unsicherheit_tage": gap / 2, "s1_bestaetigt": conf})
+                w = s1.loc[a - pd.Timedelta(days=12): b + pd.Timedelta(days=12), "vh_db"].dropna()
+                before, after = w[w.index <= mid], w[w.index > mid]
+                if len(before) and len(after):
+                    conf = bool(before.iloc[-1] - after.iloc[0] >= 1.0)
+            rows.append({"datum": mid.normalize(), "frueh": a, "spaet": b,
+                         "ndvi_vor": round(float(hi_ref), 3), "ndvi_nach": round(float(nd[i]), 3),
+                         "lai_vor": round(float(la[h]), 2) if lai_ok else np.nan,
+                         "lai_nach": round(float(la[i]), 2) if lai_ok else np.nan,
+                         "unsicherheit_tage": gap / 2, "s1_bestaetigt": conf, "kriterium": krit, "nutzung": nu,
+                         "_staerke": rel if np.isfinite(rel) else d_ndvi})
     df = pd.DataFrame(rows)
     if df.empty:
-        return df
-    # Doppelte Treffer desselben Schnitts zusammenfassen
+        return leer     # keine Schnitte erkannt: leere Tabelle mit allen Spalten
+    df = df.sort_values("datum").reset_index(drop=True)
     keep = [0]
     for j in range(1, len(df)):
         if (df.loc[j, "datum"] - df.loc[keep[-1], "datum"]).days < min_sep_days:
-            if df.loc[j, "ndvi_vor"] - df.loc[j, "ndvi_nach"] > df.loc[keep[-1], "ndvi_vor"] - df.loc[keep[-1], "ndvi_nach"]:
+            if df.loc[j, "_staerke"] > df.loc[keep[-1], "_staerke"]:
                 keep[-1] = j
         else:
             keep.append(j)
-    return df.loc[keep].reset_index(drop=True)
+    return df.loc[keep, SCHNITT_SPALTEN].reset_index(drop=True)
 
 
 def synthetic_s2(model_trace_by_year: dict[int, np.ndarray], seed: int = 3) -> pd.DataFrame:
     """Kunst-Satellitenreihe aus Modell-LAI (nur Testmodus): NDVI = 0.9 - 0.75·exp(-0.6·LAI) + Rauschen,
+    LAI = Modell-LAI + Rauschen (σ = max(0,5; 0,25·LAI)),
     Aufnahmen alle 5 Tage, 55 % bewölkt."""
     rng = np.random.default_rng(seed)
     rows = []
@@ -396,8 +614,10 @@ def synthetic_s2(model_trace_by_year: dict[int, np.ndarray], seed: int = 3) -> p
         for d in range(0, 365, 5):
             lai = tr[d, 7] if tr.shape[1] > 7 else 2.0
             ndvi = 0.9 - 0.75 * math.exp(-0.6 * lai) + rng.normal(0, 0.03)
+            lai_obs = max(0.0, lai + rng.normal(0, max(0.5, 0.25 * lai)))
             clear = 1.0 if rng.random() > 0.55 else rng.random() * 0.5
             day = dt.date(y, 1, 1) + dt.timedelta(days=d)
             rows.append({"date": pd.Timestamp(day), "clear": clear, "ndvi": ndvi,
-                         "ndvi_q25": ndvi - 0.03, "ndvi_q75": ndvi + 0.03, "ndre": ndvi * 0.6})
+                         "ndvi_q25": ndvi - 0.03, "ndvi_q75": ndvi + 0.03, "ndre": ndvi * 0.6,
+                         "lai": lai_obs, "lai_q25": lai_obs - 0.3, "lai_q75": lai_obs + 0.3})
     return pd.DataFrame(rows).set_index("date")
