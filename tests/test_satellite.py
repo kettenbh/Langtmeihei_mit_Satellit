@@ -85,3 +85,12 @@ def test_arable_year_classified_and_skipped():
 def test_single_dark_image_does_not_make_arable():
     nd = [0.8, 0.85, 0.15, 0.86, 0.84, 0.8]
     assert SAT.nutzung_je_jahr(_s2(nd)) == {2024: SAT.NUTZUNG_GRUENLAND}
+
+
+def test_nutzung_dunst_mit_schnellem_wiederergruenen_bleibt_gruenland():
+    # zwei Dunsttage Anfang April, fünf Tage später wieder voll grün: kein Saatbett
+    nd = [0.28, 0.26, 0.74, 0.73, 0.9, 0.91, 0.9, 0.7, 0.78, 0.86]
+    assert SAT.nutzung_je_jahr(_s2(nd)) == {2024: SAT.NUTZUNG_GRUENLAND}
+    # offen über Wochen (Saatbett): Acker
+    nd2 = [0.25, 0.22, 0.24, 0.3, 0.4, 0.5, 0.62, 0.7, 0.78, 0.86]
+    assert SAT.nutzung_je_jahr(_s2(nd2)) == {2024: SAT.NUTZUNG_ACKER}

@@ -179,3 +179,133 @@ def korrektur_aus_analysen(analysen: pd.DataFrame, modell: pd.DataFrame) -> tupl
                 d_xp.append(float(r["xp"]) - float(modell.loc[i, "xp_heu"]))
     n = max(len(d_nel), len(d_xp))
     return (float(np.mean(d_nel)) if d_nel else 0.0), (float(np.mean(d_xp)) if d_xp else 0.0), n
+
+
+# ---------------------------------------------------------------------------
+# Hybrid: Zielkonflikt Menge/Qualität aus dem Analyse-Ensemble (Modell + Sentinel-2)
+# ---------------------------------------------------------------------------
+def _kurve_aus_ensemble(S, P, w_ist: dict, clim: dict, stichtag: int, a, horizon: int, korrektur,
+                        min_masse_kg: float = 300.0) -> pd.DataFrame:
+    """S, P: Ensemble-Zustand/Parameter am Ende des Stichtags (n Mitglieder). Jedes Mitglied läuft mit jedem
+    Klimajahr als Restwetter (n × k Läufe auf einmal), ohne Schnitt bis zum Kandidatentag."""
+    from . import ensemble as E
+    jahre = sorted(clim)
+    k, n = len(jahre), S.n
+    scen = {key: np.stack([np.concatenate([w_ist[key][:stichtag + 1], clim[y][key][stichtag + 1:]]) for y in jahre])
+            for key in w_ist}                                               # (k, 365)
+    ok_s, rt_s = E.dry_windows(scen["rain"], scen["et0"], a)                # (k, 365)
+    W = {key: np.tile(v, (n, 1)) for key, v in scen.items()}                # Zeile i -> Szenario i % k
+    S = S.repeat(k)
+    P = P.repeat(k)
+    sz = np.tile(np.arange(k), n)
+    out = []
+    for h in range(0, horizon + 1):
+        d = stichtag + h
+        if d >= 365 - a.trockentage_noetig:
+            break
+        if h > 0:
+            E.run_ensemble(W, P, a, state=S, start=d, end=d + 1, manage=False)
+        H, omd, rest = E.harvestable(S, P, a.schnitthoehe_m)
+        m = H > min_masse_kg
+        if m.sum() < min(5, len(m)):
+            continue
+        gruen = np.maximum(0, S.GV - rest[0]) + np.maximum(0, S.GR - rest[1])
+        tot = np.maximum(0, S.DV - rest[2]) + np.maximum(0, S.DR - rest[3])
+        rt = rt_s[sz, d]
+        nel = nel_aus_omd(omd, a.rohasche_g_kg) + korrektur[0]
+        xp = xp_mischung(gruen, tot, P.NI, a.kleeanteil, a.n_leguminosen_pct, a.n_totmasse_pct,
+                         w_gruen_bestand_kg=S.GV + S.GR) + korrektur[1]
+        nel_h, xp_h = heu_abschlag(nel, xp, rt, a.belueftung)
+        verlust = np.minimum(0.6, a.feldverlust_basis + a.feldverlust_je_regentag * rt)
+        netto = H * (1 - verlust)
+        # Qualität nur über Mitglieder mit nennenswerter Masse (direkt nach dem Schnitt bestimmt sonst die
+        # Stoppel die Werte); Anteil erntewürdiger Mitglieder als eigene Spalte
+        r = {"tag": d, "n": int(m.sum()), "p_heuwetter": float(ok_s[:, d].mean()),
+             "p_erntewuerdig": float(np.mean(H >= a.min_ertrag_kg_tm_ha))}
+        for name, v, alle in (("brutto_dt", H / 100, True), ("netto_dt", netto / 100, True), ("nel", nel_h, False),
+                              ("xp", xp_h, False), ("energie_gj", netto * nel_h / 1000.0, True)):
+            for q in (10, 50, 90):
+                r[f"{name}_q{q}"] = float(np.percentile(v if alle else v[m], q))
+        r["st"] = float(np.median(S.ST))
+        r["schnitt_nr"] = int(np.median(S.n_cuts)) + 1
+        r["tage_seit"] = int(np.median(d - S.last_cut))
+        out.append(r)
+    return pd.DataFrame(out)
+
+
+def regel_schnitt_hypothesen(w: dict, p, a, stichtag: int, fenster: list, abstand: int = 20,
+                             breite: int = 7) -> list[tuple[int, int]]:
+    """Schnitttermine der Schnittregel (Ist-Wetter, App-Parameter) bis zum Stichtag, die kein erkanntes
+    Schnittfenster in ±abstand Tagen haben, als Fenster ±breite. In einer Wolkenlücke sieht der Satellit
+    einen Schnitt oft nicht; ein Betrieb lässt den ersten Aufwuchs aber kaum bis in den Juli stehen."""
+    from . import ensemble as E
+    P = E.EnsembleParams.from_params(p, 1)
+    S = E.run_ensemble({k: v[None, :stichtag + 1] for k, v in w.items()}, P, a, end=stichtag + 1, manage=True)
+    out = []
+    for c in S.cut_day[0]:
+        c = int(c)
+        if c < 0 or c > stichtag:
+            continue
+        if any(f - abstand <= c <= sp + abstand for f, sp in fenster):
+            continue
+        out.append((c - breite, min(c + breite, stichtag)))
+    return out
+
+
+def schnittkurve_hybrid(daten, stichtag: int, clim: dict, p, a, horizon: int = 45, korrektur=(0.0, 0.0),
+                        cfg=None, posterior=None, n: int = 32, seed: int = 0,
+                        alter_korrigieren: bool = True, schnitt_resampling: int = 0,
+                        schnitt_nachtragen: bool = True, regel_hypothesen: bool = True):
+    """Wie schnittkurve, aber der Bestand am Stichtag kommt aus der EnKF-Analyse mit Sentinel-2-LAI und den
+    aus dem Satelliten erkannten Schnitten (statt aus der Schnittregel mit Ist-Wetter).
+
+    daten: relativ.JahrDaten des laufenden Jahres (Wetter, Beobachtungen, Schnittfenster).
+    Rückgabe: (Kurve wie schnittkurve, Info-Dict mit Aufnahmen, Schnitten, Analyse)."""
+    from . import assimilation as DA_
+    from . import beobachtung as B
+    from .config import DA
+    cfg = cfg or DA
+    stichtag = int(min(stichtag, daten.n_ist - 1))
+    o = daten.obs
+    msk = o.tag <= stichtag
+    obs = B.Beobachtungen(o.tag[msk], o.wert[msk], o.sigma[msk], o.clear[msk])
+    fen = [(f, min(s_, stichtag)) for f, s_ in daten.fenster if f <= stichtag]
+    hyp = regel_schnitt_hypothesen(daten.w, p, a, stichtag, fen) if regel_hypothesen else []
+    an = DA_.analyse_saison(daten.w, p, a, obs, None, ende=stichtag + 1, cfg=cfg, seed=seed, posterior=posterior,
+                            n=n if posterior is None else posterior.n, schnitt_fenster=fen,
+                            alter_korrigieren=alter_korrigieren, schnitt_resampling=schnitt_resampling,
+                            schnitt_nachtragen=schnitt_nachtragen, schnitt_hypothesen=hyp)
+    kurve = _kurve_aus_ensemble(an.zustand, an.params, daten.w, clim, stichtag, a, horizon, korrektur)
+    info = {"aufnahmen": len(obs), "schnitte": fen, "hypothesen": hyp,
+            "nachgetragen": an.nachgetragene_schnitte, "letzte_aufnahme": int(obs.tag.max()) if len(obs) else None,
+            "analyse": an, "lai_heute": float(np.mean(an.zustand.lai(an.params)))}
+    return kurve, info
+
+
+def kurve_mischen(hybrid: pd.DataFrame, modell: pd.DataFrame, gewicht_hybrid: float = 0.5,
+                  spalten=("nel", "xp")) -> pd.DataFrame:
+    """Menge und Energieertrag aus dem Hybrid, Qualität (NEL, XP) als gewichtetes Mittel von Hybrid und Modell.
+    Hintergrund: der Satellit misst die Menge (LAI), das Blattalter nur indirekt über erkannte Schnitte."""
+    if hybrid.empty or modell.empty:
+        return hybrid
+    out = hybrid.copy()
+    m = modell.set_index("tag").reindex(out["tag"])
+    for name in spalten:
+        for q in (10, 50, 90):
+            c = f"{name}_q{q}"
+            mv = m[c].to_numpy()
+            out[c] = np.where(np.isfinite(mv), gewicht_hybrid * out[c].to_numpy() + (1 - gewicht_hybrid) * mv, out[c])
+    # Energieertrag mit gemischter NEL neu (netto bleibt aus dem Hybrid)
+    faktor = out["nel_q50"] / hybrid["nel_q50"].replace(0, np.nan)
+    for q in (10, 50, 90):
+        out[f"energie_gj_q{q}"] = hybrid[f"energie_gj_q{q}"] * faktor.fillna(1.0)
+    return out
+
+
+def schnittkurve_modell_ensemble(w_ist: dict, stichtag: int, clim: dict, p, a, horizon: int = 45,
+                                 korrektur=(0.0, 0.0)) -> pd.DataFrame:
+    """Gegenstück ohne Satellit mit demselben Rechenweg: ein Mitglied, Schnittregel mit Ist-Wetter bis Stichtag."""
+    from . import ensemble as E
+    P = E.EnsembleParams.from_params(p, 1)
+    S = E.run_ensemble({k: v[None, :] for k, v in w_ist.items()}, P, a, end=stichtag + 1, manage=True)
+    return _kurve_aus_ensemble(S, P, w_ist, clim, stichtag, a, horizon, korrektur)

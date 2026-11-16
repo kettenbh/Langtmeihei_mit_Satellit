@@ -459,7 +459,8 @@ NUTZUNG_GRUENLAND = "Grünland"
 NUTZUNG_ACKER = "Acker/Umbruch"
 
 
-def nutzung_je_jahr(s2: pd.DataFrame, max_ndvi_offen: float = 0.3, min_offen: int = 2) -> dict[int, str]:
+def nutzung_je_jahr(s2: pd.DataFrame, max_ndvi_offen: float = 0.3, min_offen: int = 2,
+                    gruen_ndvi: float = 0.6, gruen_tage: int = 20) -> dict[int, str]:
     """Nutzung je Jahr aus der NDVI-Reihe: Grünland ist von März bis Oktober nie großflächig offen.
 
     Ein Jahr gilt als "Acker/Umbruch", wenn mindestens `min_offen` klare Aufnahmen von März bis Oktober
@@ -467,6 +468,8 @@ def nutzung_je_jahr(s2: pd.DataFrame, max_ndvi_offen: float = 0.3, min_offen: in
     Getreideernte, Umbruch). Eine einzelne Aufnahme reicht nicht, weil Dunst, den die SCL-Maske nicht
     erkennt, einzelne Tage auf NDVI 0,1 bis 0,2 drücken kann (z. B. 29.10.2024 auf allen drei Feldern).
     Gemähtes Grünland bleibt dagegen über 0,45, auch in Trockenphasen.
+    Eine offene Aufnahme zählt nicht, wenn innerhalb von `gruen_tage` danach wieder eine klare Aufnahme mit
+    NDVI ≥ `gruen_ndvi` folgt: Saatbett, Umbruch oder Stoppel brauchen Wochen bis dahin, Dunst nicht.
     """
     if s2 is None or s2.empty or "ndvi" not in s2:
         return {}
@@ -474,7 +477,12 @@ def nutzung_je_jahr(s2: pd.DataFrame, max_ndvi_offen: float = 0.3, min_offen: in
     out = {}
     for y in sorted(set(s2.index.year)):
         d = c[(c.index.year == y) & (c.index.month >= 3) & (c.index.month <= 10)]
-        offen = int((d["ndvi"] < max_ndvi_offen).sum())
+        nd, tage = d["ndvi"].to_numpy(), d.index
+        offen = 0
+        for i in np.flatnonzero(nd < max_ndvi_offen):
+            danach = (tage > tage[i]) & (tage <= tage[i] + pd.Timedelta(days=gruen_tage))
+            if not (nd[danach] >= gruen_ndvi).any():
+                offen += 1
         out[int(y)] = NUTZUNG_ACKER if offen >= min_offen else NUTZUNG_GRUENLAND
     return out
 
