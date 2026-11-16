@@ -11,6 +11,7 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 from heu import kalibrierung as KAL
+from heu import ndre as ND
 from heu import qualitaet as Q
 from heu import relativ as REL
 from heu import satellite as SAT
@@ -43,6 +44,9 @@ with st.sidebar:
                                "erkannten Schnitten (Tab „Satellit“ der Hauptseite) statt Schnittregel. Ohne "
                                "Satellitendaten eines Feldes steht nur das Modell zur Wahl.")
     FELD = _felder[_opts.index(quelle) - 1] if quelle in _opts[1:] else None
+    MIT_NDRE = st.checkbox("Rohprotein mit N-Status aus NDRE stützen", value=True, disabled=FELD is None,
+                           help="Red-Edge-Index von Sentinel-2 im laufenden Aufwuchs, relativ zur eigenen Geschichte "
+                                "des Feldes. Skaliert den N-Ernährungsindex für das Rohprotein (±30 % höchstens).")
 
 A = replace(A0, kleeanteil=klee, rohasche_g_kg=xa, belueftung=bel)
 try:
@@ -79,7 +83,8 @@ ST = doy365(stichtag)
 
 
 @st.cache_resource(show_spinner="Analyse mit Sentinel-2 bis zum Stichtag (EnKF, 32 Mitglieder) …")
-def hybrid_kurve(feld_id: str, s2_stand: str, stichtag: int, a, horizon: int, korr: tuple, tok: int, n: int = 32):
+def hybrid_kurve(feld_id: str, s2_stand: str, stichtag: int, a, horizon: int, korr: tuple, tok: int,
+                 mit_ndre: bool = True, n: int = 32):
     s2_ = SAT.load_cached(feld_id, "s2")
     s1_ = SAT.load_cached(feld_id, "s1")
     nutzung = SAT.nutzung_je_jahr(s2_).get(a.simulations_jahr)
@@ -88,8 +93,11 @@ def hybrid_kurve(feld_id: str, s2_stand: str, stichtag: int, a, horizon: int, ko
         return None, {"grund": "zu wenige Wetterdaten im laufenden Jahr"}
     post, cfg = KAL.prior_fuer_assimilation(feld_id, a)
     ep = REL.feste_mitglieder(p, a, n, cfg, posterior=post)
+    ref = ND.referenz(s2_) if mit_ndre else None
+    status = ND.n_status(s2_, ref) if ref is not None else None
     k, info = Q.schnittkurve_hybrid(daten, stichtag, clim, p, a, horizon=horizon, korrektur=korr, cfg=cfg,
-                                    posterior=ep, seed=stichtag)
+                                    posterior=ep, seed=stichtag, n_status=status, jahr=a.simulations_jahr)
+    info["n_status"] = status
     an = info.pop("analyse")
     info.update(kalibriert=post is not None, nutzung=nutzung,
                 n=an.n)
@@ -100,7 +108,8 @@ kurve_m = Q.schnittkurve(cur, clim, ST, p, A, horizon=horizon, korrektur=KORR)
 kurve, H_INFO = kurve_m, None
 if FELD is not None:
     s2_r = SAT.load_cached(FELD["id"], "s2")
-    kh, H_INFO = hybrid_kurve(FELD["id"], f"{s2_r.index.max():%Y-%m-%d}/{len(s2_r)}", ST, A, horizon, KORR, ui.token())
+    kh, H_INFO = hybrid_kurve(FELD["id"], f"{s2_r.index.max():%Y-%m-%d}/{len(s2_r)}", ST, A, horizon, KORR, ui.token(),
+                              MIT_NDRE)
     if H_INFO.get("nutzung") == SAT.NUTZUNG_ACKER:
         st.warning(f"{FELD['name']}: {JAHR} sieht im Satelliten nach Acker/Umbruch aus. Das Grünlandmodell passt "
                    "dann nicht; die Hybrid-Kurve ist nur eingeschränkt aussagekräftig.")
@@ -109,7 +118,10 @@ if FELD is not None:
         H_INFO = None
     else:
         # Menge und bester Tag aus dem Hybrid, NEL/XP zur Hälfte aus dem Modell (im Zwillingsexperiment am besten)
-        kurve = Q.kurve_mischen(kh, kurve_m)
+        # (der Modellanteil am Rohprotein bekommt denselben N-Faktor aus dem NDRE)
+        km_n = kurve_m if H_INFO["ni_faktor"] == 1.0 else \
+            Q.schnittkurve(cur, clim, ST, p, A, horizon=horizon, korrektur=KORR, ni_faktor=H_INFO["ni_faktor"])
+        kurve = Q.kurve_mischen(kh, km_n)
 if kurve.empty:
     st.info("Kein erntbarer Aufwuchs im betrachteten Zeitraum.")
     st.stop()
@@ -135,6 +147,10 @@ if H_INFO is not None:
     if H_INFO["nachgetragen"]:
         teile.append("aus LAI-Einbruch nachgetragen: " + ", ".join(f"{_d(f)}–{_d(sp)}" for f, sp in H_INFO["nachgetragen"]))
     teile.append(f"LAI heute (Analyse) {H_INFO['lai_heute']:.1f}")
+    nf = H_INFO.get("n_faktor")
+    if nf is not None:
+        teile.append(f"N-Status aus NDRE {nf.faktor:.2f} × Feldmittel ({nf.n} Aufnahmen seit "
+                     f"{nf.von:%d.%m.})" if nf.n else "N-Status aus NDRE: keine Aufnahme im laufenden Aufwuchs (Faktor 1)")
     teile.append("Parameter aus der Feldkalibrierung" if H_INFO["kalibriert"] else "Feld noch nicht kalibriert (Stufe A auf der Hauptseite)")
     st.caption(" · ".join(teile))
     if H_INFO["letzte_aufnahme"] is not None and ST - H_INFO["letzte_aufnahme"] > 20:
@@ -190,6 +206,27 @@ st.caption("Bänder: 10–90 % über die Wetterszenarien 1991–2025 nach dem St
            + (" Im Hybrid-Modus streuen die Bänder zusätzlich über die Ensemble-Mitglieder (Zustand und Parameter "
               "nach der Analyse); NEL und XP sind das Mittel aus Hybrid und Modell. Grau gestrichelt: Median nur mit Modell "
               "und Schnittregel." if H_INFO is not None else ""))
+
+# --- N-Status aus NDRE --------------------------------------------------------
+if H_INFO is not None and H_INFO.get("n_status") is not None and not H_INFO["n_status"].empty:
+    with st.expander("N-Status aus NDRE (Red-Edge) im Jahresverlauf", expanded=False):
+        ns = H_INFO["n_status"]
+        fn = go.Figure()
+        alt_ = ns[ns.index.year != JAHR]
+        fn.add_scatter(x=[date_from_doy(JAHR, doy365(d.date())) for d in alt_.index], y=alt_["r"], mode="markers",
+                       marker=dict(color=GRAU, size=5, opacity=0.5), name="frühere Jahre")
+        jetzt = ns[ns.index.year == JAHR]
+        fn.add_scatter(x=[d.date() for d in jetzt.index], y=jetzt["r"], mode="markers+lines",
+                       marker=dict(color=GRUEN, size=8), line=dict(color=GRUEN, width=1), name=str(JAHR))
+        fn.add_hline(y=1.0, line_dash="dash", line_color="black")
+        fn.add_vline(x=stichtag, line_color=ORANGE, line_dash="dash")
+        fn.update_layout(height=320, margin=dict(t=20, b=10), yaxis_title="Chlorophyll relativ zum Feldmittel",
+                         legend=dict(orientation="h", y=-0.2))
+        st.plotly_chart(fn, width="stretch")
+        st.caption("Je klare Aufnahme mit LAI ≥ 1: Chlorophyll-Index Red-Edge (B8A/B05 − 1) geteilt durch den für "
+                   "diesen LAI feld-üblichen Wert. Über 1: grüner/N-reicher als sonst, unter 1: blasser. Aus den "
+                   "Aufnahmen seit dem letzten Schnitt (höchstens 28 Tage) wird ein Faktor auf den N-Index des "
+                   "Rohproteins, zur 1 hin geschrumpft, weil eine Einzelaufnahme etwa ±10 % rauscht.")
 
 # --- Historische Verteilung je Schnitt ---------------------------------------
 st.subheader("Qualität je Schnitt im Vergleich zu 1991–2025")
@@ -266,6 +303,13 @@ Unterschied. Hauptfehlerquelle bleiben falsch datierte Schnitte (Wolkenlücken);
 läge der NEL-Fehler im Juni bei etwa 0,23 MJ, die Menge bei der Hälfte.
 
 **Grenzen.** Kein Pflanzenbestandsmodell (Gräser/Kräuter/Klee fest), keine Live-Daten der LfL-Reifeprüfung
-(lassen sich nur manuell vergleichen), Sentinel-2-NDRE fließt noch nicht ein (Rohprotein bleibt modellbasiert). Erwartete Genauigkeit ohne
+(lassen sich nur manuell vergleichen). Der NDRE-N-Status ist relativ zum Feld und nicht an Futteranalysen geeicht.
+
+**NDRE für das Rohprotein.** Der Chlorophyll-Index Red-Edge CIre = B8A/B05 − 1 steigt mit dem Chlorophyll je
+Bodenfläche. Den LAI-Anteil nimmt eine feldeigene Referenzkurve CIre(LAI) aus allen Grünlandjahren heraus; der Rest
+ist der Chlorophyllgehalt der Blätter, der dem N-Ernährungszustand folgt (Annahme: proportional). In Niederham
+schwankt dieser Rest um etwa ±13 % je Aufnahme, davon etwa ±10 % Rauschen und ±8 % echtes Signal. Im
+Zwillingsexperiment (`scripts/ndre_zwilling.py`, N-Status je Aufwuchs ±8 %) sinkt der Rohproteinfehler damit um etwa
+1–2 g/kg TM. Das ist eine Obergrenze, weil der künstliche NDRE nach derselben Annahme erzeugt ist. Erwartete Genauigkeit ohne
 Kalibrierung etwa ±0,3–0,5 MJ NEL (Schätzung).
 """)

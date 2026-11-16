@@ -120,12 +120,18 @@ def wahre_parameter(p: ModVegeParams, **abweichung) -> ModVegeParams:
     return replace(p, **abweichung)
 
 
+CI_REF_NIEDERHAM = (6.08, 0.45, -0.98)   # heu.ndre.referenz(Niederham 2017–2026): a, b, c
+
+
 def synthetische_s2_reihe(lai: np.ndarray, jahr: int, rng: np.random.Generator, dunst: float = 0.05,
-                          p_bewoelkt: float = 0.55, lai_rel: float = 0.25):
+                          p_bewoelkt: float = 0.55, lai_rel: float = 0.25, ni_rel: np.ndarray | None = None,
+                          ndre_sigma: float = 0.10, ci_ref=CI_REF_NIEDERHAM, gamma: float = 1.0):
     """S2-Cache-ähnliche Tabelle (wie satellite.load_cached) aus einer wahren LAI-Reihe: Überflug alle
     5 Tage, p_bewoelkt unbrauchbar, NDVI = 0,91 − 0,70·exp(−0,96·LAI) + N(0; 0,035) (angepasst an 406 klare
     Aufnahmen von Wiese Ost/West), LAI mit relativem Fehler lai_rel, Anteil `dunst` der klaren Aufnahmen
-    als unerkannter Dunst (NDVI −0,15…−0,45, LAI ×0,5…0,9)."""
+    als unerkannter Dunst (NDVI −0,15…−0,45, LAI ×0,5…0,9).
+    NDRE über den Chlorophyll-Index: CIre = ref(LAI_beob)·ni_rel^gamma·exp(N(0; ndre_sigma)), ref wie heu.ndre
+    (Niederham), ni_rel = wahrer N-Status relativ zum Feldmittel je Tag (Standard 1)."""
     import datetime as dt
     import pandas as pd
     rows = []
@@ -137,6 +143,9 @@ def synthetische_s2_reihe(lai: np.ndarray, jahr: int, rng: np.random.Generator, 
         if rng.random() < dunst:
             nd -= rng.uniform(0.15, 0.45)
             lo *= rng.uniform(0.5, 0.9)
+        a_, b_, c_ = ci_ref
+        ci = max(0.05, a_ * (1 - np.exp(-b_ * lo)) + c_) * (1.0 if ni_rel is None else ni_rel[d]) ** gamma \
+            * np.exp(rng.normal(0, ndre_sigma))
         rows.append({"date": pd.Timestamp(dt.date(jahr, 1, 1) + dt.timedelta(days=d)), "clear": 1.0,
-                     "ndvi": nd, "lai": lo})
+                     "ndvi": nd, "lai": lo, "ndre": ci / (ci + 2)})
     return pd.DataFrame(rows).set_index("date")

@@ -92,9 +92,9 @@ def geerntet(s, p, h: float):
     return gv + gr, dv + dr
 
 
-def xp_bestand(s, p, a) -> float:
+def xp_bestand(s, p, a, ni_faktor: float = 1.0) -> float:
     gruen, tot = geerntet(s, p, a.schnitthoehe_m)
-    return float(xp_mischung(gruen, tot, p.NI, a.kleeanteil, a.n_leguminosen_pct, a.n_totmasse_pct,
+    return float(xp_mischung(gruen, tot, p.NI * ni_faktor, a.kleeanteil, a.n_leguminosen_pct, a.n_totmasse_pct,
                              w_gruen_bestand_kg=s.GV + s.GR))
 
 
@@ -102,7 +102,7 @@ def xp_bestand(s, p, a) -> float:
 # Zielkonflikt Menge/Qualität über kommende Schnitttage (alle Wetterszenarien)
 # ---------------------------------------------------------------------------
 def schnittkurve(cur, clim: dict, stichtag: int, p, a, horizon: int = 45, perfect_days: int = 0,
-                 korrektur: tuple[float, float] = (0.0, 0.0)) -> pd.DataFrame:
+                 korrektur: tuple[float, float] = (0.0, 0.0), ni_faktor: float = 1.0) -> pd.DataFrame:
     """Je Kandidatentag: Quantile von Masse, NEL, XP (als Heu) und Energieertrag [GJ NEL/ha] über alle Szenarien.
 
     Es wird bis zum Kandidatentag nicht gemäht (Bestand wächst weiter)."""
@@ -125,7 +125,7 @@ def schnittkurve(cur, clim: dict, stichtag: int, p, a, horizon: int = 45, perfec
                 continue
             ok, rt = dry_window(w, d, a)
             nel = float(nel_aus_omd(omd, a.rohasche_g_kg)) + korrektur[0]
-            xp = xp_bestand(s, p, a) + korrektur[1]
+            xp = xp_bestand(s, p, a, ni_faktor) + korrektur[1]
             nel_h, xp_h = heu_abschlag(nel, xp, rt, a.belueftung)
             verlust = min(0.6, a.feldverlust_basis + a.feldverlust_je_regentag * rt)
             netto = H * (1 - verlust)
@@ -185,7 +185,7 @@ def korrektur_aus_analysen(analysen: pd.DataFrame, modell: pd.DataFrame) -> tupl
 # Hybrid: Zielkonflikt Menge/Qualität aus dem Analyse-Ensemble (Modell + Sentinel-2)
 # ---------------------------------------------------------------------------
 def _kurve_aus_ensemble(S, P, w_ist: dict, clim: dict, stichtag: int, a, horizon: int, korrektur,
-                        min_masse_kg: float = 300.0) -> pd.DataFrame:
+                        min_masse_kg: float = 300.0, ni_faktor: float = 1.0) -> pd.DataFrame:
     """S, P: Ensemble-Zustand/Parameter am Ende des Stichtags (n Mitglieder). Jedes Mitglied läuft mit jedem
     Klimajahr als Restwetter (n × k Läufe auf einmal), ohne Schnitt bis zum Kandidatentag."""
     from . import ensemble as E
@@ -213,7 +213,7 @@ def _kurve_aus_ensemble(S, P, w_ist: dict, clim: dict, stichtag: int, a, horizon
         tot = np.maximum(0, S.DV - rest[2]) + np.maximum(0, S.DR - rest[3])
         rt = rt_s[sz, d]
         nel = nel_aus_omd(omd, a.rohasche_g_kg) + korrektur[0]
-        xp = xp_mischung(gruen, tot, P.NI, a.kleeanteil, a.n_leguminosen_pct, a.n_totmasse_pct,
+        xp = xp_mischung(gruen, tot, P.NI * ni_faktor, a.kleeanteil, a.n_leguminosen_pct, a.n_totmasse_pct,
                          w_gruen_bestand_kg=S.GV + S.GR) + korrektur[1]
         nel_h, xp_h = heu_abschlag(nel, xp, rt, a.belueftung)
         verlust = np.minimum(0.6, a.feldverlust_basis + a.feldverlust_je_regentag * rt)
@@ -255,7 +255,8 @@ def regel_schnitt_hypothesen(w: dict, p, a, stichtag: int, fenster: list, abstan
 def schnittkurve_hybrid(daten, stichtag: int, clim: dict, p, a, horizon: int = 45, korrektur=(0.0, 0.0),
                         cfg=None, posterior=None, n: int = 32, seed: int = 0,
                         alter_korrigieren: bool = True, schnitt_resampling: int = 0,
-                        schnitt_nachtragen: bool = True, regel_hypothesen: bool = True):
+                        schnitt_nachtragen: bool = True, regel_hypothesen: bool = True, ni_faktor: float = 1.0,
+                        n_status=None, jahr: int | None = None):
     """Wie schnittkurve, aber der Bestand am Stichtag kommt aus der EnKF-Analyse mit Sentinel-2-LAI und den
     aus dem Satelliten erkannten Schnitten (statt aus der Schnittregel mit Ist-Wetter).
 
@@ -275,10 +276,21 @@ def schnittkurve_hybrid(daten, stichtag: int, clim: dict, p, a, horizon: int = 4
                             n=n if posterior is None else posterior.n, schnitt_fenster=fen,
                             alter_korrigieren=alter_korrigieren, schnitt_resampling=schnitt_resampling,
                             schnitt_nachtragen=schnitt_nachtragen, schnitt_hypothesen=hyp)
-    kurve = _kurve_aus_ensemble(an.zustand, an.params, daten.w, clim, stichtag, a, horizon, korrektur)
+    lc = an.zustand.last_cut[an.zustand.last_cut >= 0]
+    letzter = int(np.median(lc)) if len(lc) and np.mean(an.zustand.last_cut >= 0) >= 0.5 else None
+    nf = None
+    if n_status is not None and jahr is not None:
+        from . import ndre as ND
+        t = pd.Timestamp(jahr, 1, 1)
+        nf = ND.n_faktor(n_status, t + pd.Timedelta(days=stichtag),
+                         None if letzter is None else t + pd.Timedelta(days=letzter))
+        ni_faktor = ni_faktor * nf.faktor
+    kurve = _kurve_aus_ensemble(an.zustand, an.params, daten.w, clim, stichtag, a, horizon, korrektur,
+                                ni_faktor=ni_faktor)
     info = {"aufnahmen": len(obs), "schnitte": fen, "hypothesen": hyp,
             "nachgetragen": an.nachgetragene_schnitte, "letzte_aufnahme": int(obs.tag.max()) if len(obs) else None,
-            "analyse": an, "lai_heute": float(np.mean(an.zustand.lai(an.params)))}
+            "analyse": an, "lai_heute": float(np.mean(an.zustand.lai(an.params))), "letzter_schnitt": letzter,
+            "n_faktor": nf, "ni_faktor": ni_faktor}
     return kurve, info
 
 
@@ -303,9 +315,9 @@ def kurve_mischen(hybrid: pd.DataFrame, modell: pd.DataFrame, gewicht_hybrid: fl
 
 
 def schnittkurve_modell_ensemble(w_ist: dict, stichtag: int, clim: dict, p, a, horizon: int = 45,
-                                 korrektur=(0.0, 0.0)) -> pd.DataFrame:
+                                 korrektur=(0.0, 0.0), ni_faktor: float = 1.0) -> pd.DataFrame:
     """Gegenstück ohne Satellit mit demselben Rechenweg: ein Mitglied, Schnittregel mit Ist-Wetter bis Stichtag."""
     from . import ensemble as E
     P = E.EnsembleParams.from_params(p, 1)
     S = E.run_ensemble({k: v[None, :] for k, v in w_ist.items()}, P, a, end=stichtag + 1, manage=True)
-    return _kurve_aus_ensemble(S, P, w_ist, clim, stichtag, a, horizon, korrektur)
+    return _kurve_aus_ensemble(S, P, w_ist, clim, stichtag, a, horizon, korrektur, ni_faktor=ni_faktor)
